@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package nodesentinel.v1;
+
+option go_package = "github.com/HeaInSeo/NodeSentinel/protos/nodesentinel/v1;nodesentinelv1";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IngressService — NodeKit/NodeVault가 검증 작업을 큐에 등록하는 ingress API
+// ─────────────────────────────────────────────────────────────────────────────
+
+service IngressService {
+  rpc EnqueueValidationWork(EnqueueValidationWorkRequest) returns (EnqueueValidationWorkResponse);
+}
+
+message EnqueueValidationWorkRequest {
+  string artifact_kind = 1;
+  string image_repository = 2;
+  string image_digest = 3;
+  string stable_ref = 4;
+  string tool_name = 5;
+  string version = 6;
+  string cas_hash = 7;
+  repeated string requested_actions = 8;
+  string requested_fixture_set = 9;
+}
+
+message EnqueueValidationWorkResponse {
+  string job_id = 1;
+  string status = 2;
+}
