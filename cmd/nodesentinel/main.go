@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/ingress"
+	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
 	"github.com/HeaInSeo/NodeSentinel/pkg/worker"
 	nsv1 "github.com/HeaInSeo/NodeSentinel/protos/nodesentinel/v1"
@@ -44,13 +45,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start L3/L4 worker goroutine (only when K8s is reachable).
+	// Start L3/L4/L5 worker goroutine (only when K8s is reachable).
 	if kube != nil {
-		w := worker.New(store, kube, "nodesentinel-worker-0")
+		dynKube, dynErr := worker.NewDynamicKubeClient()
+		if dynErr != nil {
+			slog.Warn("dynamic K8s client unavailable — L5-b trivy scan will submit not-available records", "err", dynErr)
+		}
+		w := worker.New(store, kube, "nodesentinel-worker-0").
+			WithVaultClient(vaultclient.New()).
+			WithDynamicKubeClient(dynKube)
 		go func() {
-			slog.Info("L3/L4 worker started")
+			slog.Info("worker started (L3/L4/L5)")
 			w.Run(ctx)
-			slog.Info("L3/L4 worker stopped")
+			slog.Info("worker stopped")
 		}()
 	}
 

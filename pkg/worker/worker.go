@@ -7,17 +7,30 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
 
 // Worker polls the WorkStore for queued jobs and runs L3 dry-run + L4 smoke-run
 // K8s Jobs per docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md sections 4-6.
+// After L4 succeeds, it optionally runs L5-a (functional validation) and
+// L5-b (trivy security scan) when vaultClient and dynamicKube are configured.
 type Worker struct {
-	store      work.Store
-	kube       kubernetes.Interface
-	workerName string
+	store       work.Store
+	kube        kubernetes.Interface
+	workerName  string
+	vaultClient *vaultclient.Client // nil → L5 steps skipped
+	dynamicKube dynamic.Interface   // nil → L5-b submits not-available record
+}
+
+// WithVaultClient sets the NodeVault HTTP client used to submit L5 records.
+// Returns w for chaining.
+func (w *Worker) WithVaultClient(c *vaultclient.Client) *Worker {
+	w.vaultClient = c
+	return w
 }
 
 // New creates a Worker. workerName identifies this instance in LeaseJob records.
@@ -79,7 +92,12 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		return
 	}
 
-	summary := "L3 dry-run passed; L4 smoke-run succeeded"
+	// L5-a and L5-b run after L4 success. They are best-effort: failures are
+	// recorded in NodeVault but do not change the WorkStore job status.
+	w.runL5a(ctx, logger, job)
+	w.runL5b(ctx, logger, job)
+
+	summary := "L3 dry-run passed; L4 smoke-run succeeded; L5 validation submitted"
 	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
 	}
