@@ -1,0 +1,39 @@
+---
+# ServiceAccount for NodeSentinel (used by the K8s Deployment).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nodesentinel
+  namespace: nodesentinel-system
+---
+# ClusterRole grants NodeSentinel the minimum permissions to run L3/L4 Jobs
+# in the nodevault-smoke namespace and inspect their Pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nodesentinel-worker
+rules:
+  # L3 dry-run + L4 smoke-run Job management.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Pod inspection for failure classification (OOMKilled, ImagePullBackOff, etc.).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nodesentinel-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nodesentinel-worker
+subjects:
+  - kind: ServiceAccount
+    name: nodesentinel
+    namespace: nodesentinel-system
