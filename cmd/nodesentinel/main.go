@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open work store at %q: %v", dbPath, err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// K8s client for L3/L4 worker (in-cluster preferred, kubeconfig fallback).
 	kube, err := worker.NewKubeClient()

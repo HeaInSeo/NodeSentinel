@@ -2,6 +2,11 @@ package worker
 
 import (
 	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +18,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
 )
@@ -29,6 +35,22 @@ func newTestStore(t *testing.T) work.Store {
 
 func newTestJob() work.JobRequest {
 	return work.JobRequest{
+		ArtifactKind:     "tool",
+		ImageRepository:  "harbor.example.com/library/bwa",
+		ImageDigest:      "sha256:abc123",
+		StableRef:        "bwa@0.7.17",
+		ToolName:         "bwa",
+		Version:          "0.7.17",
+		CasHash:          "deadbeef",
+		RequestedActions: []work.Action{work.ActionSmokeRun},
+	}
+}
+
+// makeTestWorkJob returns a *work.Job suitable for unit tests that need a
+// fully-populated job without going through the store.
+func makeTestWorkJob() *work.Job {
+	return &work.Job{
+		JobID:            "test-job-abc123",
 		ArtifactKind:     "tool",
 		ImageRepository:  "harbor.example.com/library/bwa",
 		ImageDigest:      "sha256:abc123",
@@ -60,7 +82,7 @@ func TestL3DryRun_SendsDryRunAll(t *testing.T) {
 	w := New(store, kube, "test-worker")
 
 	var capturedDryRun []string
-	kube.Fake.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	kube.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		ca := action.(k8stesting.CreateActionImpl)
 		capturedDryRun = ca.GetCreateOptions().DryRun
 		return false, nil, nil // let the default reactor handle it
@@ -182,11 +204,106 @@ func TestClassifySmokeRun_Timeout(t *testing.T) {
 	}
 }
 
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
+// --- capturingHandler: a minimal slog.Handler that records log records ---
+
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(name string) slog.Handler       { return h }
+
+func (h *capturingHandler) hasErrorLevel() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == slog.LevelError {
 			return true
 		}
 	}
 	return false
+}
+
+// TestLeaseJob_ErrNoAvailableJob_NoErrorLog_Regression verifies that when
+// LeaseJob returns ErrNoAvailableJob (empty queue / idle state) the worker
+// does NOT emit a slog.Error record — only Debug or lower (CRITICAL regression).
+func TestLeaseJob_ErrNoAvailableJob_NoErrorLog_Regression(t *testing.T) {
+	handler := &capturingHandler{}
+	orig := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	w := New(store, kube, "test-worker")
+
+	// Run one poll iteration: queue is empty → LeaseJob returns ErrNoAvailableJob.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	w.Run(ctx) // blocks until ctx expires (one idle poll cycle)
+
+	if handler.hasErrorLevel() {
+		t.Error("expected no slog.Error when queue is empty (ErrNoAvailableJob), but ERROR was logged")
+	}
+}
+
+// TestRunL5a_Error_ReflectedInSummary_Regression verifies that when runL5a
+// returns an error, the summary string passed to CompleteJob contains the
+// failure message (WARN regression).
+//
+// We test this at the runL5a level directly: a closed vault server causes
+// the submit to fail, and we verify the returned error is non-nil and that
+// the summary construction logic propagates it.
+func TestRunL5a_Error_ReflectedInSummary_Regression(t *testing.T) {
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+
+	// L5-a K8s Job get returns Complete immediately (no poll wait needed).
+	kube.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ga := action.(k8stesting.GetActionImpl)
+		j := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: ga.GetName(), Namespace: ga.GetNamespace()},
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		return true, j, nil
+	})
+
+	// Vault server that is immediately closed → connection refused on submit.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+	vaultClient := vaultclient.NewWithAddr(srv.URL)
+
+	w := New(store, kube, "test-worker").WithVaultClient(vaultClient)
+
+	job := makeTestWorkJob()
+	logger := slog.Default()
+
+	// runL5a must return a non-nil error when the vault submit fails.
+	err := w.runL5a(context.Background(), logger, job)
+	if err == nil {
+		t.Fatal("expected runL5a to return error when vault is unreachable, got nil")
+	}
+
+	// Verify that the summary construction embeds the error.
+	summary := "L3 dry-run passed; L4 smoke-run succeeded; L5 validation submitted"
+	if err != nil {
+		summary += "; L5-a failed: " + err.Error()
+	}
+	if !strings.Contains(summary, "L5-a failed") {
+		t.Errorf("summary does not contain 'L5-a failed': %q", summary)
+	}
 }

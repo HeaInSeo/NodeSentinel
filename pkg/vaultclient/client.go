@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -30,11 +31,19 @@ type Client struct {
 }
 
 // New creates a Client. The base URL is read from NODEVAULT_API_ADDR.
+// Trailing slashes in the address are stripped to prevent double-slash URLs.
 func New() *Client {
 	addr := os.Getenv("NODEVAULT_API_ADDR")
 	if addr == "" {
 		addr = defaultVaultAPIAddr
 	}
+	return NewWithAddr(addr)
+}
+
+// NewWithAddr creates a Client with an explicit base URL, ignoring
+// NODEVAULT_API_ADDR. Trailing slashes are stripped.
+func NewWithAddr(addr string) *Client {
+	addr = strings.TrimRight(addr, "/")
 	return &Client{
 		baseURL: addr,
 		http:    &http.Client{Timeout: defaultRequestTimeout},
@@ -117,9 +126,12 @@ func (c *Client) post(ctx context.Context, url string, body any) (*SubmitRespons
 	if err != nil {
 		return nil, fmt.Errorf("vaultclient: POST %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if readErr != nil {
+		return nil, fmt.Errorf("vaultclient: read response body: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("vaultclient: POST %s: HTTP %d: %s", url, resp.StatusCode, respBody)
 	}

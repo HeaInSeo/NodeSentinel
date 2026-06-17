@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -23,6 +24,13 @@ const (
 // l5aJobName returns a deterministic DNS-safe Job name for the L5-a validation run.
 func l5aJobName(job *work.Job) string {
 	return fmt.Sprintf("l5a-%s", sanitizeDNSLabel(job.JobID))
+}
+
+// l5aCommandSlice returns the Command slice used in the K8s Job spec.
+// It is derived by splitting l5aCommand so that the hash input and the
+// actual Job spec share a single source of truth.
+func l5aCommandSlice() []string {
+	return strings.Fields(l5aCommand)
 }
 
 // buildL5aJobSpec constructs the K8s Job for L5-a functional validation.
@@ -52,7 +60,7 @@ func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 						{
 							Name:    "validate",
 							Image:   image,
-							Command: []string{"/bin/sh", "-c", "true"},
+							Command: l5aCommandSlice(),
 						},
 					},
 				},
@@ -65,10 +73,12 @@ func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 // image, waits for completion, and submits a ToolCheckRecord to NodeVault.
 // Infra failures (scheduling, timeout, OOM) produce an "infra_failed" record;
 // they are not treated as job failures so L4-successful jobs remain succeeded.
-func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job) {
+// Returns a non-nil error when the submission itself fails, so the caller can
+// reflect the failure in the CompleteJob summary.
+func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job) error {
 	if w.vaultClient == nil {
 		logger.Info("L5-a skipped: no vault client configured")
-		return
+		return nil
 	}
 
 	checkID := fmt.Sprintf("l5a-%s", sanitizeDNSLabel(job.JobID))
@@ -82,29 +92,31 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 	created, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(l5aCtx, jobSpec, metav1.CreateOptions{})
 	if err != nil {
 		logger.Warn("L5-a job creation failed", "err", err)
-		w.submitCheckRecord(ctx, logger, job, checkID, command, 0,
+		return w.submitCheckRecord(ctx, logger, job, checkID, command, 0,
 			"infra_failed", "", "infra-level: job creation failed: "+err.Error(), 0, false)
-		return
 	}
 	logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 
 	exitCode, isInfra, runErr := w.waitL5aJob(l5aCtx, logger, job, created.Name)
 	durationSec := int64(time.Since(startedAt).Seconds())
-	_ = w.deleteJob(context.Background(), smokeNamespace, created.Name)
+	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil {
+		logger.Warn("L5-a: failed to delete K8s Job — TTL will clean up",
+			"job", created.Name, "err", delErr)
+	}
 
 	switch {
 	case isInfra && runErr != nil:
 		logger.Warn("L5-a infra-level failure", "err", runErr)
-		w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
+		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
 			"infra_failed", "", runErr.Error(), durationSec, false)
 	case runErr != nil:
 		logger.Info("L5-a application-level failure", "exit_code", exitCode, "err", runErr)
-		w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
+		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
 			"failed", "", runErr.Error(), durationSec, false)
 	default:
 		validationHash := computeValidationHash(job.ImageDigest, command, exitCode)
 		logger.Info("L5-a validation succeeded", "validation_hash", validationHash)
-		w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
+		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
 			"succeeded", validationHash, "", durationSec, true)
 	}
 }
@@ -162,17 +174,20 @@ func (w *Worker) extractPodExitCode(ctx context.Context, jobName string) int {
 	return -1
 }
 
-// isInfraReason returns true for K8s Job failure reasons that are infrastructure-
-// level (scheduling, node eviction, deadline) rather than application-level.
+// isInfraReason returns true for K8s Job-level failure reasons that are
+// infrastructure-level (scheduling, deadline) rather than application-level.
+// Note: "Evicted" is a Pod-level reason and must not be included here — K8s
+// Job Failed condition reasons are BackoffLimitExceeded, DeadlineExceeded, etc.
 func isInfraReason(reason string) bool {
 	switch reason {
-	case "BackoffLimitExceeded", "DeadlineExceeded", "Evicted":
+	case "BackoffLimitExceeded", "DeadlineExceeded":
 		return true
 	}
 	return false
 }
 
 // submitCheckRecord builds and sends a SubmitCheckRecordRequest to NodeVault.
+// Returns the submission error (if any) so the caller can propagate it.
 func (w *Worker) submitCheckRecord(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -182,9 +197,14 @@ func (w *Worker) submitCheckRecord(
 	validationStatus, validationHash, failureReason string,
 	durationSec int64,
 	allOutputsPresent bool,
-) {
-	contractResult := "passed"
-	if validationStatus != "succeeded" {
+) error {
+	var contractResult string
+	switch validationStatus {
+	case "succeeded":
+		contractResult = "passed"
+	case "infra_failed":
+		contractResult = "not_applicable"
+	default:
 		contractResult = "failed"
 	}
 
@@ -206,9 +226,10 @@ func (w *Worker) submitCheckRecord(
 	if _, err := w.vaultClient.SubmitCheckRecord(ctx, req); err != nil {
 		logger.Error("L5-a: failed to submit check record to NodeVault",
 			"check_id", checkID, "err", err)
-		return
+		return err
 	}
 	logger.Info("L5-a check record submitted", "check_id", checkID, "status", validationStatus)
+	return nil
 }
 
 // computeValidationHash computes a deterministic SHA-256 hash over the inputs
@@ -216,6 +237,6 @@ func (w *Worker) submitCheckRecord(
 // resource profiles, and stdout/stderr are excluded for reproducibility.
 func computeValidationHash(imageDigest, command string, exitCode int) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%d", imageDigest, command, exitCode)
+	_, _ = fmt.Fprintf(h, "%s|%s|%d", imageDigest, command, exitCode)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }

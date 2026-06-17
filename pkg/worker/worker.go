@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -46,7 +47,11 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		job, err := w.store.LeaseJob(ctx, w.workerName, time.Duration(leaseTTL)*time.Second)
 		if err != nil {
-			slog.Error("LeaseJob error", "err", err)
+			if errors.Is(err, work.ErrNoAvailableJob) {
+				slog.Debug("LeaseJob: no available job", "err", err)
+			} else {
+				slog.Error("LeaseJob error", "err", err)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -94,10 +99,16 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 
 	// L5-a and L5-b run after L4 success. They are best-effort: failures are
 	// recorded in NodeVault but do not change the WorkStore job status.
-	w.runL5a(ctx, logger, job)
-	w.runL5b(ctx, logger, job)
+	l5aErr := w.runL5a(ctx, logger, job)
+	l5bErr := w.runL5b(ctx, logger, job)
 
 	summary := "L3 dry-run passed; L4 smoke-run succeeded; L5 validation submitted"
+	if l5aErr != nil {
+		summary += "; L5-a failed: " + l5aErr.Error()
+	}
+	if l5bErr != nil {
+		summary += "; L5-b failed: " + l5bErr.Error()
+	}
 	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
 	}

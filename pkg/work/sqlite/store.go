@@ -276,7 +276,7 @@ FROM jobs
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []*work.Job
 	for rows.Next() {

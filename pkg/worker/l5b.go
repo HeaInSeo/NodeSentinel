@@ -23,15 +23,16 @@ var trivyVulnReportGVR = schema.GroupVersionResource{
 // and submits a ToolScanRecord to NodeVault. When the CRD is absent or no
 // matching report exists, a "not-available" record is submitted so certification
 // can proceed without being blocked by missing scan infrastructure.
-func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job) {
+// Returns a non-nil error when the submission itself fails, so the caller can
+// reflect the failure in the CompleteJob summary.
+func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job) error {
 	if w.vaultClient == nil {
 		logger.Info("L5-b skipped: no vault client configured")
-		return
+		return nil
 	}
 	if w.dynamicKube == nil {
 		logger.Info("L5-b: no dynamic k8s client — submitting not-available scan record")
-		w.submitNotAvailableScanRecord(ctx, logger, job)
-		return
+		return w.submitNotAvailableScanRecord(ctx, logger, job)
 	}
 
 	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
@@ -41,8 +42,7 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 	)
 	if err != nil {
 		logger.Warn("L5-b: trivy VulnerabilityReport CRD not available", "err", err)
-		w.submitNotAvailableScanRecord(ctx, logger, job)
-		return
+		return w.submitNotAvailableScanRecord(ctx, logger, job)
 	}
 
 	// Find the VulnerabilityReport whose artifact digest matches the tool image.
@@ -59,12 +59,19 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 
 	if matched == nil {
 		logger.Info("L5-b: no matching VulnerabilityReport found, submitting not-available")
-		w.submitNotAvailableScanRecord(ctx, logger, job)
-		return
+		return w.submitNotAvailableScanRecord(ctx, logger, job)
+	}
+
+	// parseTrivySummary returns a summary with empty Scanner when parsing fails.
+	// Treat missing Scanner as a not-available fallback to avoid submitting a
+	// structurally invalid record.
+	if matched.Scanner == "" {
+		logger.Warn("L5-b: VulnerabilityReport parsed but Scanner is empty — submitting not-available")
+		return w.submitNotAvailableScanRecord(ctx, logger, job)
 	}
 
 	policyResult := "passed"
-	if matched.CriticalCount > 0 {
+	if matched.CriticalCount > 0 || matched.HighCount > 0 {
 		policyResult = "warning"
 	}
 
@@ -84,13 +91,14 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 	}
 	if _, err := w.vaultClient.SubmitScanRecord(ctx, req); err != nil {
 		logger.Error("L5-b: failed to submit scan record", "scan_id", scanID, "err", err)
-		return
+		return err
 	}
 	logger.Info("L5-b scan record submitted",
 		"scan_id", scanID, "critical", matched.CriticalCount, "high", matched.HighCount)
+	return nil
 }
 
-func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.Logger, job *work.Job) {
+func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.Logger, job *work.Job) error {
 	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
 	req := vaultclient.SubmitScanRecordRequest{
 		ScanID:       scanID,
@@ -103,7 +111,9 @@ func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.
 	}
 	if _, err := w.vaultClient.SubmitScanRecord(ctx, req); err != nil {
 		logger.Error("L5-b: failed to submit not-available scan record", "err", err)
+		return err
 	}
+	return nil
 }
 
 // trivyVulnSummary holds the fields we extract from a VulnerabilityReport.
