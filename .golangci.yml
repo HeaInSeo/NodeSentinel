@@ -1,0 +1,140 @@
+version: "2"
+
+run:
+  allow-parallel-runners: true
+  timeout: 10m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - gocheckcompilerdirectives
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - revive
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (*os.File).Close
+
+    govet:
+      enable:
+        - nilness
+        - shadow
+
+    gosec:
+      excludes:
+        - G115
+      config:
+        G101:
+          pattern: "(?i)passwd|password|secret|apikey|api_key|token|credential|private.?key"
+          ignore_entropy: false
+          entropy_threshold: "80.0"
+          per_char_threshold: "3.0"
+          truncate: "32"
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - exitAfterDefer
+        - hugeParam
+        - rangeValCopy
+        - unnamedResult
+        - ifElseChain
+        - whyNoLint
+
+    misspell:
+      locale: US
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          disabled: true
+        - name: indent-error-flow
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: unused-parameter
+        - name: unreachable-code
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: ".*_test\\.go$"
+        linters:
+          - errcheck
+          - gocritic
+          - gosec
+          - govet
+          - misspell
+          - noctx
+          - revive
+          - unparam
+      - linters:
+          - errcheck
+        text: "Error return value of `(db.Close|tx.Rollback|rows.Close|store.Close|s.Close|w.store.FailJob|w.deleteJob|fmt.Fprintf)`"
+      - linters:
+          - errorlint
+        text: "comparing with != will fail on wrapped errors"
+      - linters:
+          - unparam
+        text: "always receives"
+      - path: ".*\\.pb\\.go$"
+        linters:
+          - revive
+          - gosec
+          - gocritic
+      - path: ".*_grpc\\.pb\\.go$"
+        linters:
+          - revive
+          - gosec
+          - gocritic
+    paths:
+      - vendor$
+      - third_party$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/HeaInSeo/NodeSentinel
+  exclusions:
+    generated: lax
+    paths:
+      - vendor$
+      - third_party$

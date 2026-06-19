@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	// Register the sqlite3 database driver used by sql.Open.
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"

@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nodesentinel-system
+  labels:
+    app.kubernetes.io/name: nodesentinel
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nodevault-smoke
+  labels:
+    app.kubernetes.io/name: nodevault-smoke

@@ -39,7 +39,7 @@ func New(store work.Store, kube kubernetes.Interface, workerName string) *Worker
 	return &Worker{store: store, kube: kube, workerName: workerName}
 }
 
-// Run polls for queued jobs and processes them. It blocks until ctx is cancelled.
+// Run polls for queued jobs and processes them. It blocks until ctx is canceled.
 func (w *Worker) Run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {

@@ -97,6 +97,103 @@ func TestRetryableFailureReturnsJobToQueue(t *testing.T) {
 	}
 }
 
+func TestNonRetryableFailureMarksJobFailed(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-failed")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	leased, err := store.LeaseJob(ctx, "worker-a", 5*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	if err := store.FailJob(ctx, leased.JobID, "worker-a", "contract failed", false); err != nil {
+		t.Fatalf("FailJob non-retryable: %v", err)
+	}
+
+	got, err := store.GetJob(ctx, leased.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.Status != work.StatusFailed {
+		t.Fatalf("status = %q, want %q", got.Status, work.StatusFailed)
+	}
+	if got.LastError != "contract failed" {
+		t.Fatalf("last error = %q, want contract failed", got.LastError)
+	}
+}
+
+func TestWrongWorkerCannotCompleteJob(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-owner")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	leased, err := store.LeaseJob(ctx, "worker-a", 5*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+
+	err = store.CompleteJob(ctx, leased.JobID, "worker-b", "should not complete")
+	if err != work.ErrNotFound {
+		t.Fatalf("CompleteJob wrong worker err = %v, want %v", err, work.ErrNotFound)
+	}
+
+	got, err := store.GetJob(ctx, leased.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.Status != work.StatusLeased {
+		t.Fatalf("status = %q, want %q", got.Status, work.StatusLeased)
+	}
+}
+
+func TestListJobsFiltersByStatus(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-a")); err != nil {
+		t.Fatalf("CreateJob job-a: %v", err)
+	}
+	if _, err := store.CreateJob(ctx, sampleRequest("job-b")); err != nil {
+		t.Fatalf("CreateJob job-b: %v", err)
+	}
+	leased, err := store.LeaseJob(ctx, "worker-a", 5*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	if err := store.CompleteJob(ctx, leased.JobID, "worker-a", "done"); err != nil {
+		t.Fatalf("CompleteJob: %v", err)
+	}
+
+	queued, err := store.ListJobs(ctx, work.StatusQueued)
+	if err != nil {
+		t.Fatalf("ListJobs queued: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queued jobs = %d, want 1", len(queued))
+	}
+
+	succeeded, err := store.ListJobs(ctx, work.StatusSucceeded)
+	if err != nil {
+		t.Fatalf("ListJobs succeeded: %v", err)
+	}
+	if len(succeeded) != 1 {
+		t.Fatalf("succeeded jobs = %d, want 1", len(succeeded))
+	}
+}
+
+func TestGetJobNotFound(t *testing.T) {
+	store := newStore(t)
+	_, err := store.GetJob(context.Background(), "missing")
+	if err != work.ErrNotFound {
+		t.Fatalf("GetJob err = %v, want %v", err, work.ErrNotFound)
+	}
+}
+
 func newStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 

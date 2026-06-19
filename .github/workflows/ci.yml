@@ -15,6 +15,7 @@ concurrency:
 
 env:
   GO_VERSION_FILE: go.mod
+  COVERAGE_THRESHOLD: "70.0"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
@@ -36,7 +37,7 @@ jobs:
         with:
           version: latest
           install-mode: goinstall
-          args: --timeout 10m
+          args: --config=.golangci.yml --timeout 10m
 
   # ──────────────────────────────────────────────────────────────────
   # 2. 빌드 검증
@@ -59,7 +60,7 @@ jobs:
         run: go vet ./...
 
   # ──────────────────────────────────────────────────────────────────
-  # 3. 유닛 테스트 (-race, -cover)
+  # 3. 유닛 테스트 (-race, -cover, 70% gate)
   # ──────────────────────────────────────────────────────────────────
   test-unit:
     name: Unit Tests
@@ -74,13 +75,24 @@ jobs:
 
       - name: go test (unit, -race, -cover)
         run: |
+          packages="$(go list ./... | grep -v '/cmd/' | grep -v '/protos/' | grep -v '/test/k8s')"
           go test \
             -v \
             -race \
-            -cover \
             -covermode=atomic \
             -coverprofile=coverage.out \
-            ./...
+            $packages
+
+      - name: Enforce coverage >= 70%
+        run: |
+          coverage="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
+          awk -v got="$coverage" -v want="$COVERAGE_THRESHOLD" 'BEGIN {
+            if (got + 0 < want + 0) {
+              printf("coverage %.1f%% below required %.1f%%\n", got, want)
+              exit 1
+            }
+            printf("coverage %.1f%% >= %.1f%%\n", got, want)
+          }'
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
@@ -91,7 +103,24 @@ jobs:
           retention-days: 14
 
   # ──────────────────────────────────────────────────────────────────
-  # 4. 취약점 스캔 (govulncheck)
+  # 4. K8s data-plane contract tests (bori-facing manifests)
+  # ──────────────────────────────────────────────────────────────────
+  k8s-contract:
+    name: K8s Data Plane Contract
+    runs-on: [self-hosted, linux, podbridge5]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: manifest contract tests
+        run: go test -v ./test/k8s/...
+
+  # ──────────────────────────────────────────────────────────────────
+  # 5. 취약점 스캔 (govulncheck)
   # ──────────────────────────────────────────────────────────────────
   vuln-scan:
     name: Vulnerability Scan (govulncheck)

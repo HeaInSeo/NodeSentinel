@@ -2,16 +2,53 @@ package ingress_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/ingress"
+	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
 	nsv1 "github.com/HeaInSeo/NodeSentinel/protos/nodesentinel/v1"
 )
+
+type failingStore struct{}
+
+func (f failingStore) CreateJob(context.Context, work.JobRequest) (*work.Job, error) {
+	return nil, errors.New("store unavailable")
+}
+
+func (f failingStore) LeaseJob(context.Context, string, time.Duration) (*work.Job, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f failingStore) Heartbeat(context.Context, string, string, time.Duration) error {
+	return errors.New("not implemented")
+}
+
+func (f failingStore) CompleteJob(context.Context, string, string, string) error {
+	return errors.New("not implemented")
+}
+
+func (f failingStore) FailJob(context.Context, string, string, string, bool) error {
+	return errors.New("not implemented")
+}
+
+func (f failingStore) GetJob(context.Context, string) (*work.Job, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f failingStore) ListJobs(context.Context, work.Status) ([]*work.Job, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f failingStore) Close() error {
+	return nil
+}
 
 func newTestServer(t *testing.T) *ingress.Server {
 	t.Helper()
@@ -97,5 +134,14 @@ func TestEnqueueValidationWork_NilRequest(t *testing.T) {
 	_, err := srv.EnqueueValidationWork(context.Background(), nil)
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestEnqueueValidationWork_StoreFailure(t *testing.T) {
+	srv := ingress.NewServer(failingStore{})
+
+	_, err := srv.EnqueueValidationWork(context.Background(), validRequest())
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal", status.Code(err))
 	}
 }

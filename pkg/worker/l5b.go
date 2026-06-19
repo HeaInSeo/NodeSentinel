@@ -152,8 +152,8 @@ func nestedStr(obj map[string]interface{}, fields ...string) (string, bool) {
 			return "", false
 		}
 		if i == len(fields)-1 {
-			s, ok := v.(string)
-			return s, ok
+			value, isString := v.(string)
+			return value, isString
 		}
 		cur, ok = v.(map[string]interface{})
 		if !ok {

@@ -97,8 +97,13 @@ go build ./...
 ### 테스트
 
 ```bash
-go test -race ./...
+make test
+make coverage-check
 ```
+
+`coverage-check`는 서비스 패키지 statement coverage가 70% 미만이면 실패한다.
+Generated proto, `cmd/nodesentinel` 부트스트랩, manifest-only contract test 패키지는
+build/contract job에서 별도로 검증하고 coverage 분모에서는 제외한다.
 
 ### 실행 (로컬 디버깅)
 
@@ -108,7 +113,29 @@ SMOKE_NAMESPACE=nodevault-smoke \
 go run ./cmd/nodesentinel
 ```
 
-Kubernetes 배포는 NodeVault `deploy/` 매니페스트와 함께 동일 네임스페이스(`nodevault-system`)에 배포한다.
+Kubernetes 배포는 향후 `bori`가 담당한다. 이 repo의 `deploy/`는 bori가 소비할 기준 계약으로 유지한다.
+
+---
+
+## K8s 데이터 플레인 계약
+
+NodeSentinel은 향후 `bori`가 배포를 오케스트레이션할 K8s 데이터 플레인 앱이다. 이 repo의
+`deploy/` 매니페스트는 직접 배포용 스크립트가 아니라 **bori가 소비해야 할 기준 계약**으로
+관리한다.
+
+| 파일 | 계약 |
+|------|------|
+| `deploy/00-namespace.yaml` | `nodesentinel-system`, `nodevault-smoke` 네임스페이스 |
+| `deploy/02-rbac.yaml` | L3/L4/L5 Job 생성·조회·삭제, Pod/Pod log 조회 권한 |
+| `deploy/03-nodesentinel.yaml` | gRPC 50052, SQLite emptyDir, NodeVault REST 주소, smoke namespace |
+| `deploy/01-grpcroute.yaml` | Gateway API GRPCRoute 외부 노출 계약 |
+
+데이터 플레인 안전 조건:
+
+- 컨테이너는 `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`을 유지한다.
+- NodeSentinel 본체는 Buildah/Podman 권한을 갖지 않는다. 검증 Job 생성과 결과 제출만 담당한다.
+- 이미지 태그는 `latest`를 쓰지 않는다. bori 릴리스 파이프라인에서 명시 태그/다이제스트로 치환한다.
+- CI의 `k8s-contract` job은 bori-facing 매니페스트가 위 계약을 깨지 않는지 검사한다.
 
 ---
 
@@ -118,10 +145,26 @@ Kubernetes 배포는 NodeVault `deploy/` 매니페스트와 함께 동일 네임
 
 | Job | 내용 |
 |-----|------|
-| `lint` | golangci-lint (zero-warning) |
+| `lint` | `.golangci.yml` 기반 golangci-lint (gosec/bodyclose/noctx/sql checks 포함) |
 | `build` | go build + go vet |
-| `test` | -race -cover |
+| `test-unit` | `go test -race -covermode=atomic`, 서비스 패키지 coverage 70% 미만 실패 |
+| `k8s-contract` | bori-facing K8s 데이터 플레인 매니페스트 계약 테스트 |
 | `vuln-scan` | govulncheck (continue-on-error) |
+
+로컬에서도 같은 기준을 사용한다:
+
+```bash
+make lint
+make test
+make coverage-check
+go test -v ./test/k8s/...
+```
+
+테스트 정책:
+
+- fail path: 저장소 장애, 잘못된 worker lease, K8s Job create/get 실패, NodeVault REST 장애를 명시적으로 테스트한다.
+- regression: L5-a hash/command 계약, infra/application failure 분류, bori-facing 매니페스트 포트/RBAC/securityContext를 고정한다.
+- K8s API 호출은 unit 단계에서 `client-go` fake client로 검증하고, 실제 클러스터 배포/rollout은 bori 트랙에서 담당한다.
 
 ---
 
