@@ -26,7 +26,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   workflow-lint:
     name: Workflow Lint (actionlint)
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +40,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   proto-lint:
     name: Proto Lint (Buf)
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +55,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   lint:
     name: Lint
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +78,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   build:
     name: Build and Vet
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -101,7 +101,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   test-unit:
     name: Unit Tests
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +129,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   k8s-contract:
     name: K8s Data Plane Contract
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -146,7 +146,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   vuln-scan:
     name: Vulnerability Scan (govulncheck)
-    runs-on: [self-hosted, linux, podbridge5]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
