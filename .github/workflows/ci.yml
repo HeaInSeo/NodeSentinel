@@ -30,10 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: actionlint
-        uses: rhysd/actionlint@v1
+      - uses: actions/setup-go@v5
         with:
-          args: -shellcheck=
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@latest -shellcheck=
 
   # ──────────────────────────────────────────────────────────────────
   # 1. Proto API lint (Buf)
@@ -68,7 +71,7 @@ jobs:
         run: make lint-config
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --config=.golangci.yml --timeout 10m
