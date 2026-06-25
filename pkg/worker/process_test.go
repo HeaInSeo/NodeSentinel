@@ -23,6 +23,22 @@ import (
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
 
+func useFastWorkerTicks(t *testing.T) {
+	t.Helper()
+
+	originalPoll := pollFrequency
+	originalHeartbeat := heartbeatFrequency
+	originalSmokeRun := smokeRunDuration
+	pollFrequency = time.Millisecond
+	heartbeatFrequency = time.Millisecond
+	smokeRunDuration = 100 * time.Millisecond
+	t.Cleanup(func() {
+		pollFrequency = originalPoll
+		heartbeatFrequency = originalHeartbeat
+		smokeRunDuration = originalSmokeRun
+	})
+}
+
 // alwaysCompleteReactor returns a fake reactor that makes every Job Get
 // return a Complete condition immediately, bypassing the poll wait.
 func alwaysCompleteReactor(ns string) k8stesting.ReactionFunc {
@@ -61,10 +77,9 @@ func absorbDryRunReactor() k8stesting.ReactionFunc {
 
 // TestProcess_L4Success_L5Skipped verifies that process() completes a job
 // successfully when L5 is not configured (vaultClient nil).
-//
-// Note: the poll ticker in runSmokeRun fires after 5 seconds, so this test
-// takes ~5 seconds to complete.
 func TestProcess_L4Success_L5Skipped(t *testing.T) {
+	useFastWorkerTicks(t)
+
 	store := newTestStore(t)
 	kube := fake.NewClientset()
 	// absorbDryRunReactor must be prepended first so it runs before the
@@ -100,9 +115,9 @@ func TestProcess_L4Success_L5Skipped(t *testing.T) {
 
 // TestProcess_L4Success_WithVault_L5Submitted verifies that process() with a
 // vault client submits L5 records and produces a meaningful summary.
-//
-// Note: poll ticker fires after 5 seconds; test takes ~10 seconds (L4 + L5-a).
 func TestProcess_L4Success_WithVault_L5Submitted(t *testing.T) {
+	useFastWorkerTicks(t)
+
 	store := newTestStore(t)
 	kube := fake.NewClientset()
 	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
@@ -183,6 +198,8 @@ func TestProcess_L3DryRunFails_JobRetried(t *testing.T) {
 // TestRunSmokeRun_Complete verifies that runSmokeRun returns success when the
 // K8s Job reports Complete=True on the first poll.
 func TestRunSmokeRun_Complete(t *testing.T) {
+	useFastWorkerTicks(t)
+
 	kube := fake.NewClientset()
 	kube.PrependReactor("get", "jobs", alwaysCompleteReactor(smokeNamespace))
 
@@ -233,6 +250,8 @@ func TestRunSmokeRun_CreateFails(t *testing.T) {
 
 // TestRunSmokeRun_GetFails verifies retryable failure when polling Get errors.
 func TestRunSmokeRun_GetFails(t *testing.T) {
+	useFastWorkerTicks(t)
+
 	kube := fake.NewClientset()
 	// First reactor: let the create succeed.
 	// Second reactor: make Get fail.

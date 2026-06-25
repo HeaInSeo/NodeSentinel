@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"log"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"google.golang.org/grpc"
@@ -19,19 +19,25 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	dbPath := os.Getenv("NODESENTINEL_DB_PATH")
 	if dbPath == "" {
 		dbPath = "./nodesentinel.db"
 	}
 
-	port := os.Getenv("NODESENTINEL_GRPC_PORT")
-	if port == "" {
-		port = "50052"
+	port, err := grpcPort()
+	if err != nil {
+		slog.Error("invalid gRPC port", "err", err)
+		os.Exit(1)
 	}
+	listenAddr := net.JoinHostPort("", strconv.Itoa(port))
 
 	store, err := sqlite.New(dbPath)
 	if err != nil {
-		log.Fatalf("open work store at %q: %v", dbPath, err)
+		slog.Error("open work store", "err", err)
+		os.Exit(1)
 	}
 	defer func() { _ = store.Close() }()
 
@@ -41,9 +47,6 @@ func main() {
 		slog.Warn("K8s client unavailable — worker will not run", "err", err)
 		kube = nil
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Start L3/L4/L5 worker goroutine (only when K8s is reachable).
 	if kube != nil {
@@ -61,9 +64,11 @@ func main() {
 		}()
 	}
 
-	lis, err := net.Listen("tcp", ":"+port)
+	var listenConfig net.ListenConfig
+	lis, err := listenConfig.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("listen on port %s: %v", port, err)
+		slog.Error("listen for gRPC", "port", port, "err", err)
+		os.Exit(1)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -74,8 +79,24 @@ func main() {
 		grpcServer.GracefulStop()
 	}()
 
-	log.Printf("NodeSentinel ingress gRPC listening on :%s (db=%s)", port, dbPath)
+	slog.Info("NodeSentinel ingress gRPC listening", "port", port)
 	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("serve grpc: %v", err)
+		slog.Error("serve grpc", "err", err)
+		os.Exit(1)
 	}
+}
+
+func grpcPort() (int, error) {
+	value := os.Getenv("NODESENTINEL_GRPC_PORT")
+	if value == "" {
+		value = "50052"
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	if port < 1 || port > 65535 {
+		return 0, strconv.ErrSyntax
+	}
+	return port, nil
 }

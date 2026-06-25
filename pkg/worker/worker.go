@@ -27,6 +27,13 @@ type Worker struct {
 	dynamicKube dynamic.Interface   // nil → L5-b submits not-available record
 }
 
+var (
+	leaseDuration      = time.Duration(leaseTTL) * time.Second
+	heartbeatFrequency = time.Duration(heartbeatInterval) * time.Second
+	pollFrequency      = time.Duration(pollInterval) * time.Second
+	smokeRunDuration   = time.Duration(smokeRunTimeout) * time.Second
+)
+
 // WithVaultClient sets the NodeVault HTTP client used to submit L5 records.
 // Returns w for chaining.
 func (w *Worker) WithVaultClient(c *vaultclient.Client) *Worker {
@@ -45,7 +52,7 @@ func (w *Worker) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		job, err := w.store.LeaseJob(ctx, w.workerName, time.Duration(leaseTTL)*time.Second)
+		job, err := w.store.LeaseJob(ctx, w.workerName, leaseDuration)
 		if err != nil {
 			if errors.Is(err, work.ErrNoAvailableJob) {
 				slog.Debug("LeaseJob: no available job", "err", err)
@@ -55,7 +62,7 @@ func (w *Worker) Run(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Duration(pollInterval) * time.Second):
+			case <-time.After(pollFrequency):
 			}
 			continue
 		}
@@ -64,7 +71,7 @@ func (w *Worker) Run(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Duration(pollInterval) * time.Second):
+			case <-time.After(pollFrequency):
 			}
 			continue
 		}
@@ -88,7 +95,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	logger.Info("L3 dry-run passed")
 
 	// L4: real smoke-run.
-	smokeCtx, cancel := context.WithTimeout(ctx, time.Duration(smokeRunTimeout)*time.Second)
+	smokeCtx, cancel := context.WithTimeout(ctx, smokeRunDuration)
 	defer cancel()
 
 	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec)
@@ -131,8 +138,8 @@ func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string
 	logger.Info("L4 smoke-run Job created", "k8s_job", created.Name)
 
 	// Poll until Job completes, context expires, or deadline exceeds.
-	pollTick := time.NewTicker(5 * time.Second)
-	heartbeatTick := time.NewTicker(time.Duration(heartbeatInterval) * time.Second)
+	pollTick := time.NewTicker(pollFrequency)
+	heartbeatTick := time.NewTicker(heartbeatFrequency)
 	defer pollTick.Stop()
 	defer heartbeatTick.Stop()
 
@@ -143,7 +150,7 @@ func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string
 			_ = w.deleteJob(context.Background(), ns, created.Name)
 			return classifySmokeRun(ctx, w.kube, ns, created.Name, &batchv1.Job{})
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, time.Duration(leaseTTL)*time.Second); err != nil {
+			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
 				logger.Warn("Heartbeat failed", "err", err)
 			}
 		case <-pollTick.C:

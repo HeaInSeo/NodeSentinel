@@ -265,6 +265,8 @@ func TestLeaseJob_ErrNoAvailableJob_NoErrorLog_Regression(t *testing.T) {
 // the submit to fail, and we verify the returned error is non-nil and that
 // the summary construction logic propagates it.
 func TestRunL5a_Error_ReflectedInSummary_Regression(t *testing.T) {
+	useFastWorkerTicks(t)
+
 	store := newTestStore(t)
 	kube := fake.NewClientset()
 

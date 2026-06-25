@@ -1,15 +1,39 @@
-.PHONY: fmt lint lint-fix lint-config test coverage coverage-check build vet proto
+.PHONY: verify ci fmt fmt-check mod-tidy-check lint lint-fix lint-config buf-lint test test-unit test-k8s coverage coverage-check build vet vuln proto
 
 LOCALBIN ?= $(CURDIR)/bin
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 GOLANGCI_LINT_VERSION ?= v2.11.3
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 COVERAGE_THRESHOLD ?= 70.0
-SERVICE_PACKAGES = $(shell go list ./... | grep -v '/cmd/' | grep -v '/protos/' | grep -v '/test/k8s')
+SERVICE_PACKAGES = $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/protos/' | grep -v '/test/k8s')
+K8S_TEST_PACKAGES = ./test/k8s/...
 PROTOC    ?= protoc
 PROTO_SRC ?= ./protos
 
+verify: fmt-check mod-tidy-check lint-config lint build vet test-unit test-k8s coverage-check
+
+ci: verify
+
 fmt:
 	go fmt ./...
+
+fmt-check:
+	@test -z "$$(gofmt -l $$(find . -name '*.go' -not -path './vendor/*'))" || { \
+		echo "gofmt is required for:"; \
+		gofmt -l $$(find . -name '*.go' -not -path './vendor/*'); \
+		exit 1; \
+	}
+
+mod-tidy-check:
+	@before="$$(mktemp)"; after="$$(mktemp)"; \
+	git diff -- go.mod go.sum > "$$before"; \
+	go mod tidy; \
+	git diff -- go.mod go.sum > "$$after"; \
+	if ! diff -u "$$before" "$$after"; then \
+		rm -f "$$before" "$$after"; \
+		exit 1; \
+	fi; \
+	rm -f "$$before" "$$after"
 
 $(GOLANGCI_LINT):
 	@mkdir -p "$(LOCALBIN)"
@@ -43,6 +67,18 @@ lint-fix: $(GOLANGCI_LINT)
 lint-config: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) config verify --config=.golangci.yml
 
+$(GOVULNCHECK):
+	@mkdir -p "$(LOCALBIN)"
+	GOBIN="$(LOCALBIN)" go install golang.org/x/vuln/cmd/govulncheck@latest
+
+# ── Proto lint (Buf) ─────────────────────────────────────────────────────────
+buf-lint:
+	@command -v buf >/dev/null 2>&1 || { \
+		echo "ERROR: buf is required; install it from https://buf.build/docs/installation/" >&2; \
+		exit 1; \
+	}
+	buf lint
+
 build:
 	go build ./...
 
@@ -52,8 +88,23 @@ vet:
 test:
 	go test -v -race ./...
 
+test-unit:
+	go test -v -race -shuffle=on -count=1 $(SERVICE_PACKAGES)
+
+test-k8s:
+	go test -v -count=1 $(K8S_TEST_PACKAGES)
+
 coverage:
-	go test -v -race -covermode=atomic -coverprofile=coverage.out $(SERVICE_PACKAGES)
+	@printf "mode: atomic\n" > coverage.out
+	@set -e; \
+	i=0; \
+	for pkg in $(SERVICE_PACKAGES); do \
+		i=$$((i + 1)); \
+		profile="coverage.$$i.out"; \
+		go test -v -race -covermode=atomic -coverprofile="$$profile" "$$pkg"; \
+		tail -n +2 "$$profile" >> coverage.out; \
+		rm -f "$$profile"; \
+	done
 	go tool cover -func=coverage.out | tail -1
 
 coverage-check: coverage
@@ -64,6 +115,9 @@ coverage-check: coverage
 		} \
 		printf("coverage %.1f%% >= %.1f%%\n", got, want) \
 	}'
+
+vuln: $(GOVULNCHECK)
+	$(GOVULNCHECK) ./...
 
 # ── proto 코드 생성 ───────────────────────────────────────────────────────────
 # NodeVault와 동일한 컨벤션: .pb.go / _grpc.pb.go를 .proto와 같은 디렉토리에 생성.

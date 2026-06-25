@@ -151,6 +151,65 @@ func TestWrongWorkerCannotCompleteJob(t *testing.T) {
 	}
 }
 
+func TestExpiredLeaseCanBeReclaimed(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-expired-lease")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	firstLease, err := store.LeaseJob(ctx, "worker-a", -time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob worker-a: %v", err)
+	}
+	if firstLease.LeaseOwner != "worker-a" {
+		t.Fatalf("first lease owner = %q, want worker-a", firstLease.LeaseOwner)
+	}
+
+	secondLease, err := store.LeaseJob(ctx, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseJob worker-b: %v", err)
+	}
+	if secondLease.JobID != firstLease.JobID {
+		t.Fatalf("reclaimed job = %q, want %q", secondLease.JobID, firstLease.JobID)
+	}
+	if secondLease.LeaseOwner != "worker-b" {
+		t.Fatalf("second lease owner = %q, want worker-b", secondLease.LeaseOwner)
+	}
+	if secondLease.Attempt != firstLease.Attempt+1 {
+		t.Fatalf("attempt = %d, want %d", secondLease.Attempt, firstLease.Attempt+1)
+	}
+}
+
+func TestWrongWorkerCannotFailJob(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-fail-owner")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	leased, err := store.LeaseJob(ctx, "worker-a", time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+
+	err = store.FailJob(ctx, leased.JobID, "worker-b", "wrong owner", false)
+	if err != work.ErrNotFound {
+		t.Fatalf("FailJob wrong worker err = %v, want %v", err, work.ErrNotFound)
+	}
+
+	got, err := store.GetJob(ctx, leased.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.Status != work.StatusLeased {
+		t.Fatalf("status = %q, want %q", got.Status, work.StatusLeased)
+	}
+	if got.LastError != "" {
+		t.Fatalf("last error = %q, want empty", got.LastError)
+	}
+}
+
 func TestListJobsFiltersByStatus(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()

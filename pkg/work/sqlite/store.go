@@ -26,7 +26,7 @@ func New(path string) (*Store, error) {
 	}
 
 	store := &Store{db: db}
-	if err := store.initSchema(); err != nil {
+	if err := store.initSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -37,7 +37,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) initSchema() error {
+func (s *Store) initSchema(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 `
-	_, err := s.db.Exec(schema)
+	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}

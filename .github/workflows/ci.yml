@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,87 +17,107 @@ concurrency:
 
 env:
   GO_VERSION_FILE: go.mod
+  GOLANGCI_LINT_VERSION: v2.11.3
   COVERAGE_THRESHOLD: "70.0"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
-  # 1. 린트 (golangci-lint)
+  # 0. GitHub Actions workflow lint
+  # ──────────────────────────────────────────────────────────────────
+  workflow-lint:
+    name: Workflow Lint (actionlint)
+    runs-on: [self-hosted, linux, podbridge5]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: rhysd/actionlint@v1
+        with:
+          args: -shellcheck=
+
+  # ──────────────────────────────────────────────────────────────────
+  # 1. Proto API lint (Buf)
+  # ──────────────────────────────────────────────────────────────────
+  proto-lint:
+    name: Proto Lint (Buf)
+    runs-on: [self-hosted, linux, podbridge5]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Buf lint
+        uses: bufbuild/buf-action@v1
+        with:
+          input: protos
+          lint: true
+
+  # ──────────────────────────────────────────────────────────────────
+  # 2. 린트 (golangci-lint)
   # ──────────────────────────────────────────────────────────────────
   lint:
     name: Lint
     runs-on: [self-hosted, linux, podbridge5]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
 
+      - name: Verify golangci-lint config
+        run: make lint-config
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
-          install-mode: goinstall
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --config=.golangci.yml --timeout 10m
 
   # ──────────────────────────────────────────────────────────────────
-  # 2. 빌드 검증
+  # 3. 모듈 / 빌드 / vet 검증
   # ──────────────────────────────────────────────────────────────────
   build:
-    name: Build
+    name: Build and Vet
     runs-on: [self-hosted, linux, podbridge5]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
 
+      - name: go mod tidy check
+        run: make mod-tidy-check
+
       - name: go build
-        run: go build ./...
+        run: make build
 
       - name: go vet
-        run: go vet ./...
+        run: make vet
 
   # ──────────────────────────────────────────────────────────────────
-  # 3. 유닛 테스트 (-race, -cover, 70% gate)
+  # 4. 유닛 테스트 (-race, -shuffle, -cover, 70% gate)
   # ──────────────────────────────────────────────────────────────────
   test-unit:
     name: Unit Tests
     runs-on: [self-hosted, linux, podbridge5]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
 
-      - name: go test (unit, -race, -cover)
-        run: |
-          packages="$(go list ./... | grep -v '/cmd/' | grep -v '/protos/' | grep -v '/test/k8s')"
-          go test \
-            -v \
-            -race \
-            -covermode=atomic \
-            -coverprofile=coverage.out \
-            $packages
+      - name: go test (unit, -race, -shuffle)
+        run: make test-unit
 
       - name: Enforce coverage >= 70%
-        run: |
-          coverage="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
-          awk -v got="$coverage" -v want="$COVERAGE_THRESHOLD" 'BEGIN {
-            if (got + 0 < want + 0) {
-              printf("coverage %.1f%% below required %.1f%%\n", got, want)
-              exit 1
-            }
-            printf("coverage %.1f%% >= %.1f%%\n", got, want)
-          }'
+        run: make coverage-check
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-${{ github.run_id }}
@@ -103,38 +125,35 @@ jobs:
           retention-days: 14
 
   # ──────────────────────────────────────────────────────────────────
-  # 4. K8s data-plane contract tests (bori-facing manifests)
+  # 5. K8s data-plane contract tests (bori-facing manifests)
   # ──────────────────────────────────────────────────────────────────
   k8s-contract:
     name: K8s Data Plane Contract
     runs-on: [self-hosted, linux, podbridge5]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
 
       - name: manifest contract tests
-        run: go test -v ./test/k8s/...
+        run: make test-k8s
 
   # ──────────────────────────────────────────────────────────────────
-  # 5. 취약점 스캔 (govulncheck)
+  # 6. 취약점 스캔 (govulncheck)
   # ──────────────────────────────────────────────────────────────────
   vuln-scan:
     name: Vulnerability Scan (govulncheck)
     runs-on: [self-hosted, linux, podbridge5]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
 
       - name: govulncheck
-        continue-on-error: true
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+        run: make vuln

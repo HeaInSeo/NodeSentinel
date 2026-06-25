@@ -124,8 +124,8 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 // waitL5aJob polls the L5-a Job until it reaches a terminal condition.
 // Returns (exitCode, isInfraFailure, err). When err == nil the job succeeded.
 func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.Job, jobName string) (int, bool, error) {
-	pollTick := time.NewTicker(5 * time.Second)
-	heartbeatTick := time.NewTicker(time.Duration(heartbeatInterval) * time.Second)
+	pollTick := time.NewTicker(pollFrequency)
+	heartbeatTick := time.NewTicker(heartbeatFrequency)
 	defer pollTick.Stop()
 	defer heartbeatTick.Stop()
 
@@ -134,7 +134,7 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 		case <-ctx.Done():
 			return 0, true, fmt.Errorf("L5-a timeout: job did not complete within allotted time")
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, time.Duration(leaseTTL)*time.Second); err != nil {
+			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
 				logger.Warn("L5-a heartbeat failed", "err", err)
 			}
 		case <-pollTick.C:
