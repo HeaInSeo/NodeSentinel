@@ -76,6 +76,7 @@ func validRequest() *nsv1.EnqueueValidationWorkRequest {
 		CasHash:             "sha256:abcd",
 		RequestedActions:    []string{"smoke_run"},
 		RequestedFixtureSet: "default",
+		ValidationRequestId: "vr-test-1",
 	}
 }
 
@@ -110,6 +111,7 @@ func TestEnqueueValidationWork_MissingRequiredField(t *testing.T) {
 		{"blank requested_actions entry", func(r *nsv1.EnqueueValidationWorkRequest) {
 			r.RequestedActions = []string{"  "}
 		}},
+		{"empty validation_request_id", func(r *nsv1.EnqueueValidationWorkRequest) { r.ValidationRequestId = "" }},
 	}
 
 	for _, tt := range tests {
@@ -143,5 +145,72 @@ func TestEnqueueValidationWork_StoreFailure(t *testing.T) {
 	_, err := srv.EnqueueValidationWork(context.Background(), validRequest())
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("code = %v, want Internal", status.Code(err))
+	}
+}
+
+// TestEnqueueValidationWork_DuplicateValidationRequestID_ReturnsSameJob is
+// PR2-A's core idempotency guard: retrying the exact same logical request
+// (identical validation_request_id and payload) — e.g. after a network
+// timeout that lost the first response — must return the original job, not
+// create a second one.
+func TestEnqueueValidationWork_DuplicateValidationRequestID_ReturnsSameJob(t *testing.T) {
+	srv := newTestServer(t)
+
+	first, err := srv.EnqueueValidationWork(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("first EnqueueValidationWork: %v", err)
+	}
+	second, err := srv.EnqueueValidationWork(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("second EnqueueValidationWork: %v", err)
+	}
+	if second.GetJobId() != first.GetJobId() {
+		t.Fatalf("job_id = %q, want the same job_id as the first call (%q)", second.GetJobId(), first.GetJobId())
+	}
+}
+
+// TestEnqueueValidationWork_SameValidationRequestIDDifferentPayload_FailsPrecondition
+// guards against silently attributing an unrelated job to a caller: reusing
+// a validation_request_id for a materially different request (here, a
+// different image_digest) must be rejected, not answered with someone
+// else's job.
+func TestEnqueueValidationWork_SameValidationRequestIDDifferentPayload_FailsPrecondition(t *testing.T) {
+	srv := newTestServer(t)
+
+	if _, err := srv.EnqueueValidationWork(context.Background(), validRequest()); err != nil {
+		t.Fatalf("first EnqueueValidationWork: %v", err)
+	}
+
+	conflicting := validRequest()
+	conflicting.ImageDigest = "sha256:different"
+	_, err := srv.EnqueueValidationWork(context.Background(), conflicting)
+	if err == nil {
+		t.Fatal("expected an error for a validation_request_id reused with a different payload")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestEnqueueValidationWork_DifferentValidationRequestIDs_CreatesDistinctJobs
+// is the converse guard: two genuinely different logical requests (a
+// build's initial validation vs. a manual re-validation, say) must not be
+// collapsed into one job just because everything else about them matches.
+func TestEnqueueValidationWork_DifferentValidationRequestIDs_CreatesDistinctJobs(t *testing.T) {
+	srv := newTestServer(t)
+
+	first, err := srv.EnqueueValidationWork(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("first EnqueueValidationWork: %v", err)
+	}
+
+	second := validRequest()
+	second.ValidationRequestId = "vr-test-2"
+	secondResp, err := srv.EnqueueValidationWork(context.Background(), second)
+	if err != nil {
+		t.Fatalf("second EnqueueValidationWork: %v", err)
+	}
+	if secondResp.GetJobId() == first.GetJobId() {
+		t.Fatal("expected a distinct job_id for a distinct validation_request_id")
 	}
 }

@@ -2,10 +2,14 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	// Register the sqlite3 database driver used by sql.Open.
@@ -50,6 +54,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   cas_hash TEXT NOT NULL,
   requested_actions TEXT NOT NULL,
   requested_fixture_set TEXT NOT NULL,
+  validation_request_id TEXT,
+  request_fingerprint TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -62,28 +68,153 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 `
-	_, err := s.db.ExecContext(ctx, schema)
-	if err != nil {
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("init schema: %w", err)
+	}
+	if err := s.migrateValidationRequestID(ctx); err != nil {
+		return fmt.Errorf("migrate validation_request_id: %w", err)
 	}
 	return nil
 }
 
+// migrateValidationRequestID adds the validation_request_id/request_fingerprint
+// columns and their enforcing index to a jobs table created before this
+// migration existed. CREATE TABLE IF NOT EXISTS above already includes these
+// columns for a fresh database, so on a fresh DB every step here is a no-op;
+// this only does real work against a pre-existing jobs table.
+//
+// The column is nullable and the index is partial (WHERE ... <> ”) rather
+// than "NOT NULL DEFAULT ” + UNIQUE": every pre-existing row would migrate
+// to the same empty-string value, and a plain UNIQUE index would then fail
+// to build the moment there is more than one existing job.
+func (s *Store) migrateValidationRequestID(ctx context.Context) error {
+	hasIDCol, err := s.hasColumn(ctx, "jobs", "validation_request_id")
+	if err != nil {
+		return err
+	}
+	if !hasIDCol {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN validation_request_id TEXT`); err != nil {
+			return fmt.Errorf("add validation_request_id column: %w", err)
+		}
+	}
+
+	hasFPCol, err := s.hasColumn(ctx, "jobs", "request_fingerprint")
+	if err != nil {
+		return err
+	}
+	if !hasFPCol {
+		if _, err := s.db.ExecContext(
+			ctx, `ALTER TABLE jobs ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''`,
+		); err != nil {
+			return fmt.Errorf("add request_fingerprint column: %w", err)
+		}
+	}
+
+	const idx = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_validation_request_id
+ON jobs(validation_request_id)
+WHERE validation_request_id IS NOT NULL AND validation_request_id <> ''
+`
+	if _, err := s.db.ExecContext(ctx, idx); err != nil {
+		return fmt.Errorf("create validation_request_id index: %w", err)
+	}
+	return nil
+}
+
+// hasColumn reports whether table already has the given column, so
+// migrations can skip an ALTER TABLE ADD COLUMN that would otherwise fail
+// with "duplicate column name" on a database that already has it (SQLite
+// has no ADD COLUMN IF NOT EXISTS). table is always an internal literal —
+// never external input — since PRAGMA does not accept bound parameters.
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return false, fmt.Errorf("scan table_info row: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// requestFingerprint canonicalizes the identity-relevant fields of a
+// JobRequest so CreateJob can tell "same logical request, retried" (fields
+// match) apart from "validation_request_id reused for a different request"
+// (fields differ) — see ErrValidationRequestConflict. RequestedActions is
+// sorted first since it's semantically a set, not an ordered list.
+func requestFingerprint(req work.JobRequest) string {
+	actions := make([]string, len(req.RequestedActions))
+	for i, a := range req.RequestedActions {
+		actions[i] = string(a)
+	}
+	sort.Strings(actions)
+
+	h := sha256.New()
+	for _, field := range []string{
+		req.ArtifactKind,
+		req.ImageRepository,
+		req.ImageDigest,
+		req.StableRef,
+		req.ToolName,
+		req.Version,
+		req.CasHash,
+		strings.Join(actions, ","),
+		req.RequestedFixtureSet,
+	} {
+		h.Write([]byte(field))
+		h.Write([]byte{0}) // separator — prevents field-concatenation collisions
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CreateJob is idempotent on req.ValidationRequestID when set: a fresh
+// (job_id, validation_request_id) pair is inserted normally, but a
+// validation_request_id that already owns a job is NOT re-inserted —
+// instead CreateJob returns the existing job when the request fingerprint
+// matches (safe retry), or ErrValidationRequestConflict when it doesn't
+// (validation_request_id reused for a different logical request).
+//
+// The pre-INSERT existence check below is only a fast path for the common
+// case; concurrent callers racing on the same validation_request_id are
+// resolved by the partial UNIQUE index via ON CONFLICT ... DO NOTHING, not
+// by this check — see migrateValidationRequestID.
 func (s *Store) CreateJob(ctx context.Context, req work.JobRequest) (*work.Job, error) {
 	actions, err := json.Marshal(req.RequestedActions)
 	if err != nil {
 		return nil, fmt.Errorf("marshal actions: %w", err)
+	}
+	fingerprint := requestFingerprint(req)
+
+	var validationRequestID any
+	if req.ValidationRequestID != "" {
+		validationRequestID = req.ValidationRequestID
 	}
 
 	now := time.Now().UTC()
 	const insert = `
 INSERT INTO jobs (
   job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
-  version, cas_hash, requested_actions, requested_fixture_set, status,
-  created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  version, cas_hash, requested_actions, requested_fixture_set,
+  validation_request_id, request_fingerprint, status, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(validation_request_id) WHERE validation_request_id IS NOT NULL AND validation_request_id <> '' DO NOTHING
 `
-	_, err = s.db.ExecContext(
+	res, err := s.db.ExecContext(
 		ctx,
 		insert,
 		req.JobID,
@@ -96,6 +227,8 @@ INSERT INTO jobs (
 		req.CasHash,
 		string(actions),
 		req.RequestedFixtureSet,
+		validationRequestID,
+		fingerprint,
 		work.StatusQueued,
 		now.Format(time.RFC3339Nano),
 		now.Format(time.RFC3339Nano),
@@ -104,7 +237,39 @@ INSERT INTO jobs (
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
-	return s.GetJob(ctx, req.JobID)
+	if validationRequestID == nil {
+		// No idempotency key supplied — the partial index never covers this
+		// row, so the INSERT above always succeeds; nothing to reconcile.
+		return s.GetJob(ctx, req.JobID)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 1 {
+		return s.GetJob(ctx, req.JobID) // this call's INSERT won the race
+	}
+
+	// Conflict: validation_request_id already belongs to another job.
+	existingJobID, existingFingerprint, err := s.jobByValidationRequestID(ctx, req.ValidationRequestID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup existing job for validation_request_id %q: %w", req.ValidationRequestID, err)
+	}
+	if existingFingerprint != fingerprint {
+		return nil, work.ErrValidationRequestConflict
+	}
+	return s.GetJob(ctx, existingJobID)
+}
+
+// jobByValidationRequestID returns the job_id and request_fingerprint of the
+// job already owning validationRequestID.
+func (s *Store) jobByValidationRequestID(ctx context.Context, validationRequestID string) (jobID, fingerprint string, err error) {
+	const query = `SELECT job_id, request_fingerprint FROM jobs WHERE validation_request_id = ?`
+	if scanErr := s.db.QueryRowContext(ctx, query, validationRequestID).Scan(&jobID, &fingerprint); scanErr != nil {
+		return "", "", fmt.Errorf("select job by validation_request_id: %w", scanErr)
+	}
+	return jobID, fingerprint, nil
 }
 
 func (s *Store) LeaseJob(ctx context.Context, worker string, ttl time.Duration) (*work.Job, error) {
@@ -243,8 +408,8 @@ WHERE job_id = ? AND lease_owner = ?
 func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
 	const query = `
 SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
-       version, cas_hash, requested_actions, requested_fixture_set, status, attempt,
-       lease_owner, lease_until, last_error, result_summary, created_at, updated_at
+       version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
+       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at
 FROM jobs
 WHERE job_id = ?
 `
@@ -262,8 +427,8 @@ WHERE job_id = ?
 func (s *Store) ListJobs(ctx context.Context, status work.Status) ([]*work.Job, error) {
 	query := `
 SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
-       version, cas_hash, requested_actions, requested_fixture_set, status, attempt,
-       lease_owner, lease_until, last_error, result_summary, created_at, updated_at
+       version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
+       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at
 FROM jobs
 `
 	args := []any{}
@@ -297,15 +462,16 @@ type scanner func(dest ...any) error
 
 func scanJob(scan scanner) (*work.Job, error) {
 	var (
-		actionsJSON string
-		status      string
-		leaseOwner  string
-		leaseUntil  sql.NullString
-		lastError   string
-		result      string
-		createdAt   string
-		updatedAt   string
-		job         work.Job
+		actionsJSON         string
+		validationRequestID sql.NullString
+		status              string
+		leaseOwner          string
+		leaseUntil          sql.NullString
+		lastError           string
+		result              string
+		createdAt           string
+		updatedAt           string
+		job                 work.Job
 	)
 
 	err := scan(
@@ -319,6 +485,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&job.CasHash,
 		&actionsJSON,
 		&job.RequestedFixtureSet,
+		&validationRequestID,
 		&status,
 		&job.Attempt,
 		&leaseOwner,
@@ -331,6 +498,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	job.ValidationRequestID = validationRequestID.String
 
 	var actions []work.Action
 	if unmarshalErr := json.Unmarshal([]byte(actionsJSON), &actions); unmarshalErr != nil {

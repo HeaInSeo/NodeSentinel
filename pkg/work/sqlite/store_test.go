@@ -2,9 +2,14 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
@@ -250,6 +255,146 @@ func TestGetJobNotFound(t *testing.T) {
 	_, err := store.GetJob(context.Background(), "missing")
 	if err != work.ErrNotFound {
 		t.Fatalf("GetJob err = %v, want %v", err, work.ErrNotFound)
+	}
+}
+
+// TestMigrateValidationRequestID_ExistingRowsSurvive guards the specific
+// migration failure mode called out in review: a plain "NOT NULL DEFAULT ”
+// + UNIQUE" column would make every pre-existing row collide on the same
+// empty string the moment the index is built, since they all predate
+// validation_request_id and would migrate to the same value. This seeds a
+// jobs table using the pre-migration schema (no validation_request_id/
+// request_fingerprint columns) with more than one row, then opens it
+// through sqlite.New and checks both that opening succeeds and that the
+// pre-existing rows are still readable afterward.
+func TestMigrateValidationRequestID_ExistingRowsSurvive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-migration.sqlite")
+	seedPreMigrationJobsTable(t, path, "job-old-1", "job-old-2", "job-old-3")
+
+	store, err := sqlite.New(path)
+	if err != nil {
+		t.Fatalf("sqlite.New on a pre-migration DB with multiple existing jobs: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, id := range []string{"job-old-1", "job-old-2", "job-old-3"} {
+		got, getErr := store.GetJob(context.Background(), id)
+		if getErr != nil {
+			t.Fatalf("GetJob(%q) after migration: %v", id, getErr)
+		}
+		if got.ValidationRequestID != "" {
+			t.Errorf("GetJob(%q).ValidationRequestID = %q, want empty (pre-migration row)", id, got.ValidationRequestID)
+		}
+	}
+
+	// The migrated DB must still accept new idempotent-enqueue requests.
+	req := sampleRequest("job-new-1")
+	req.ValidationRequestID = "vr-post-migration"
+	if _, err := store.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob after migration: %v", err)
+	}
+}
+
+// seedPreMigrationJobsTable creates a jobs table matching the schema before
+// validation_request_id/request_fingerprint existed, and inserts one row per
+// given job ID directly via SQL — bypassing sqlite.New/CreateJob entirely,
+// since those already write the post-migration schema.
+func seedPreMigrationJobsTable(t *testing.T, path string, jobIDs ...string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const schema = `
+CREATE TABLE jobs (
+  job_id TEXT PRIMARY KEY,
+  artifact_kind TEXT NOT NULL,
+  image_repository TEXT NOT NULL,
+  image_digest TEXT NOT NULL,
+  stable_ref TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  cas_hash TEXT NOT NULL,
+  requested_actions TEXT NOT NULL,
+  requested_fixture_set TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_until TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("create pre-migration schema: %v", err)
+	}
+
+	const insert = `
+INSERT INTO jobs (
+  job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
+  version, cas_hash, requested_actions, requested_fixture_set, status, created_at, updated_at
+) VALUES (?, 'tool', 'harbor.example.local/library/fastp', 'sha256:1234', 'fastp@0.24.0',
+  'fastp', '0.24.0', 'sha256:abcd', '["smoke_run"]', 'default', 'queued', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+`
+	for _, id := range jobIDs {
+		if _, err := db.Exec(insert, id); err != nil {
+			t.Fatalf("seed pre-migration row %q: %v", id, err)
+		}
+	}
+}
+
+// TestCreateJob_ConcurrentDuplicateValidationRequestID_OneJobWins is the
+// race-safety guard behind CreateJob's design note: two callers racing on
+// the same validation_request_id must not both succeed with distinct jobs —
+// the partial UNIQUE index (not the pre-INSERT lookup, which only optimizes
+// the common non-racing case) is the actual arbiter.
+func TestCreateJob_ConcurrentDuplicateValidationRequestID_OneJobWins(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	const workers = 8
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		jobIDs = make(map[string]int)
+		errs   []error
+	)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := sampleRequest(fmt.Sprintf("job-race-%d", i)) // distinct job_id per caller
+			req.ValidationRequestID = "vr-race"                 // same idempotency key
+			job, err := store.CreateJob(ctx, req)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			jobIDs[job.JobID]++
+		}(i)
+	}
+	wg.Wait()
+
+	if len(errs) != 0 {
+		t.Fatalf("CreateJob errors under concurrent dedup: %v", errs)
+	}
+	if len(jobIDs) != 1 {
+		t.Fatalf("distinct job_ids returned = %v, want exactly 1 shared job_id", jobIDs)
+	}
+
+	all, err := store.ListJobs(ctx, "")
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("jobs actually persisted = %d, want 1 (all %d callers must share one job)", len(all), workers)
 	}
 }
 

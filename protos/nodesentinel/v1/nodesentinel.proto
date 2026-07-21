@@ -22,6 +22,17 @@ message EnqueueValidationWorkRequest {
   string cas_hash = 7;
   repeated string requested_actions = 8;
   string requested_fixture_set = 9;
+
+  // validation_request_id identifies one logical validation request (NOT a
+  // build): NodeVault generates a fresh one per logical request (a build's
+  // initial validation, a manual re-validation, a re-run after a fixture/
+  // profile change, ...) and reuses the same value only when retrying the
+  // exact same request after a transport/process failure. NodeSentinel
+  // treats this as an idempotency key: repeating it with an identical
+  // request returns the existing job; repeating it with a different
+  // request is rejected (FAILED_PRECONDITION) rather than silently
+  // returning the wrong job. Required — requests without it are rejected.
+  string validation_request_id = 10;
 }
 
 message EnqueueValidationWorkResponse {

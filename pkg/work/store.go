@@ -9,6 +9,13 @@ import (
 var (
 	ErrNotFound       = errors.New("workstore: job not found")
 	ErrNoAvailableJob = errors.New("workstore: no available job")
+
+	// ErrValidationRequestConflict is returned by CreateJob when
+	// ValidationRequestID matches an existing job whose request differs
+	// (a different image digest, requested actions, etc.). Reusing a
+	// validation_request_id is only valid for retrying the exact same
+	// logical request — see EnqueueValidationWorkRequest.validation_request_id.
+	ErrValidationRequestConflict = errors.New("workstore: validation_request_id already used with a different request")
 )
 
 type Status string
@@ -40,6 +47,13 @@ type JobRequest struct {
 	CasHash             string
 	RequestedActions    []Action
 	RequestedFixtureSet string
+
+	// ValidationRequestID is the caller's idempotency key (see
+	// EnqueueValidationWorkRequest.validation_request_id). CreateJob is
+	// idempotent on this field: repeating it with an identical request
+	// returns the existing job; repeating it with a different request
+	// returns ErrValidationRequestConflict.
+	ValidationRequestID string
 }
 
 type Job struct {
@@ -53,6 +67,7 @@ type Job struct {
 	CasHash             string
 	RequestedActions    []Action
 	RequestedFixtureSet string
+	ValidationRequestID string
 	Status              Status
 	Attempt             int
 	LeaseOwner          string

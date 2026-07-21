@@ -32,6 +32,16 @@ type EnqueueValidationWorkRequest struct {
 	CasHash             string                 `protobuf:"bytes,7,opt,name=cas_hash,json=casHash,proto3" json:"cas_hash,omitempty"`
 	RequestedActions    []string               `protobuf:"bytes,8,rep,name=requested_actions,json=requestedActions,proto3" json:"requested_actions,omitempty"`
 	RequestedFixtureSet string                 `protobuf:"bytes,9,opt,name=requested_fixture_set,json=requestedFixtureSet,proto3" json:"requested_fixture_set,omitempty"`
+	// validation_request_id identifies one logical validation request (NOT a
+	// build): NodeVault generates a fresh one per logical request (a build's
+	// initial validation, a manual re-validation, a re-run after a fixture/
+	// profile change, ...) and reuses the same value only when retrying the
+	// exact same request after a transport/process failure. NodeSentinel
+	// treats this as an idempotency key: repeating it with an identical
+	// request returns the existing job; repeating it with a different
+	// request is rejected (FAILED_PRECONDITION) rather than silently
+	// returning the wrong job. Required — requests without it are rejected.
+	ValidationRequestId string `protobuf:"bytes,10,opt,name=validation_request_id,json=validationRequestId,proto3" json:"validation_request_id,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -129,6 +139,13 @@ func (x *EnqueueValidationWorkRequest) GetRequestedFixtureSet() string {
 	return ""
 }
 
+func (x *EnqueueValidationWorkRequest) GetValidationRequestId() string {
+	if x != nil {
+		return x.ValidationRequestId
+	}
+	return ""
+}
+
 type EnqueueValidationWorkResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
@@ -185,7 +202,7 @@ var File_nodesentinel_v1_nodesentinel_proto protoreflect.FileDescriptor
 
 const file_nodesentinel_v1_nodesentinel_proto_rawDesc = "" +
 	"\n" +
-	"\"nodesentinel/v1/nodesentinel.proto\x12\x0fnodesentinel.v1\"\xe3\x02\n" +
+	"\"nodesentinel/v1/nodesentinel.proto\x12\x0fnodesentinel.v1\"\x97\x03\n" +
 	"\x1cEnqueueValidationWorkRequest\x12#\n" +
 	"\rartifact_kind\x18\x01 \x01(\tR\fartifactKind\x12)\n" +
 	"\x10image_repository\x18\x02 \x01(\tR\x0fimageRepository\x12!\n" +
@@ -196,7 +213,9 @@ const file_nodesentinel_v1_nodesentinel_proto_rawDesc = "" +
 	"\aversion\x18\x06 \x01(\tR\aversion\x12\x19\n" +
 	"\bcas_hash\x18\a \x01(\tR\acasHash\x12+\n" +
 	"\x11requested_actions\x18\b \x03(\tR\x10requestedActions\x122\n" +
-	"\x15requested_fixture_set\x18\t \x01(\tR\x13requestedFixtureSet\"N\n" +
+	"\x15requested_fixture_set\x18\t \x01(\tR\x13requestedFixtureSet\x122\n" +
+	"\x15validation_request_id\x18\n" +
+	" \x01(\tR\x13validationRequestId\"N\n" +
 	"\x1dEnqueueValidationWorkResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status2\x88\x01\n" +

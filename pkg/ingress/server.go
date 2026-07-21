@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,10 +56,15 @@ func (s *Server) EnqueueValidationWork(ctx context.Context, req *nsv1.EnqueueVal
 		CasHash:             req.GetCasHash(),
 		RequestedActions:    actions,
 		RequestedFixtureSet: req.GetRequestedFixtureSet(),
+		ValidationRequestID: req.GetValidationRequestId(),
 	}
 
 	job, err := s.Store.CreateJob(ctx, jobReq)
 	if err != nil {
+		if errors.Is(err, work.ErrValidationRequestConflict) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"validation_request_id %q already used with a different request", req.GetValidationRequestId())
+		}
 		return nil, status.Errorf(codes.Internal, "create job: %v", err)
 	}
 
@@ -84,10 +90,11 @@ func newJobID() string {
 // blank (empty or whitespace-only).
 func validate(req *nsv1.EnqueueValidationWorkRequest) error {
 	required := map[string]string{
-		"artifact_kind":    req.GetArtifactKind(),
-		"image_repository": req.GetImageRepository(),
-		"tool_name":        req.GetToolName(),
-		"version":          req.GetVersion(),
+		"artifact_kind":         req.GetArtifactKind(),
+		"image_repository":      req.GetImageRepository(),
+		"tool_name":             req.GetToolName(),
+		"version":               req.GetVersion(),
+		"validation_request_id": req.GetValidationRequestId(),
 	}
 	for field, value := range required {
 		if strings.TrimSpace(value) == "" {
