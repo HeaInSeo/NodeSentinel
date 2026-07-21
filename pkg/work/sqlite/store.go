@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	// Register the sqlite3 database driver used by sql.Open.
@@ -23,7 +22,14 @@ type Store struct {
 }
 
 func New(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_foreign_keys=on", path)
+	// _txlock=immediate makes every transaction opened on this DB (via
+	// Begin/BeginTx) issue "BEGIN IMMEDIATE" instead of SQLite's default
+	// deferred BEGIN. Deferred transactions take no lock until their first
+	// write, so two connections can both pass a read-then-decide check (see
+	// migrateValidationRequestID) before either one blocks — immediate
+	// transactions take the write lock up front, serializing exactly that
+	// race instead of leaving it to be resolved mid-transaction.
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_foreign_keys=on&_txlock=immediate", path)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -87,23 +93,39 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 // than "NOT NULL DEFAULT ” + UNIQUE": every pre-existing row would migrate
 // to the same empty-string value, and a plain UNIQUE index would then fail
 // to build the moment there is more than one existing job.
+// migrateValidationRequestID runs its hasColumn checks and ALTER TABLE
+// statements inside one transaction, rather than as separate autocommit
+// statements against s.db. With New's _txlock=immediate DSN option, BeginTx
+// takes SQLite's write lock up front: a second process/connection racing to
+// migrate the same pre-existing database blocks on BeginTx until the first
+// migration commits, so by the time it proceeds its hasColumn checks
+// correctly observe the already-added columns — closing the check-then-act
+// race a plain "SELECT, then maybe ALTER" sequence would otherwise have
+// across two separate connections (each individual statement is atomic, but
+// the pair isn't, without a shared lock spanning both).
 func (s *Store) migrateValidationRequestID(ctx context.Context) error {
-	hasIDCol, err := s.hasColumn(ctx, "jobs", "validation_request_id")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	hasIDCol, err := hasColumn(ctx, tx, "jobs", "validation_request_id")
 	if err != nil {
 		return err
 	}
 	if !hasIDCol {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN validation_request_id TEXT`); err != nil {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN validation_request_id TEXT`); err != nil {
 			return fmt.Errorf("add validation_request_id column: %w", err)
 		}
 	}
 
-	hasFPCol, err := s.hasColumn(ctx, "jobs", "request_fingerprint")
+	hasFPCol, err := hasColumn(ctx, tx, "jobs", "request_fingerprint")
 	if err != nil {
 		return err
 	}
 	if !hasFPCol {
-		if _, err := s.db.ExecContext(
+		if _, err := tx.ExecContext(
 			ctx, `ALTER TABLE jobs ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''`,
 		); err != nil {
 			return fmt.Errorf("add request_fingerprint column: %w", err)
@@ -115,10 +137,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_validation_request_id
 ON jobs(validation_request_id)
 WHERE validation_request_id IS NOT NULL AND validation_request_id <> ''
 `
-	if _, err := s.db.ExecContext(ctx, idx); err != nil {
+	if _, err := tx.ExecContext(ctx, idx); err != nil {
 		return fmt.Errorf("create validation_request_id index: %w", err)
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
+	}
 	return nil
+}
+
+// queryer is the subset of *sql.DB / *sql.Tx that hasColumn needs — letting
+// migrateValidationRequestID run it inside a transaction instead of as a
+// separate autocommit statement against the DB handle.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // hasColumn reports whether table already has the given column, so
@@ -126,8 +159,8 @@ WHERE validation_request_id IS NOT NULL AND validation_request_id <> ''
 // with "duplicate column name" on a database that already has it (SQLite
 // has no ADD COLUMN IF NOT EXISTS). table is always an internal literal —
 // never external input — since PRAGMA does not accept bound parameters.
-func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+func hasColumn(ctx context.Context, q queryer, table, column string) (bool, error) {
+	rows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return false, fmt.Errorf("pragma table_info(%s): %w", table, err)
 	}
@@ -156,7 +189,10 @@ func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, erro
 // JobRequest so CreateJob can tell "same logical request, retried" (fields
 // match) apart from "validation_request_id reused for a different request"
 // (fields differ) — see ErrValidationRequestConflict. RequestedActions is
-// sorted first since it's semantically a set, not an ordered list.
+// sorted first since it's semantically a set, not an ordered list, and each
+// action is hashed as its own field (not joined into one comma-separated
+// string) so an action value that happens to contain a comma can't make two
+// different action sets collide on the same fingerprint.
 func requestFingerprint(req work.JobRequest) string {
 	actions := make([]string, len(req.RequestedActions))
 	for i, a := range req.RequestedActions {
@@ -165,7 +201,8 @@ func requestFingerprint(req work.JobRequest) string {
 	sort.Strings(actions)
 
 	h := sha256.New()
-	for _, field := range []string{
+	fields := make([]string, 0, 7+len(actions))
+	fields = append(fields,
 		req.ArtifactKind,
 		req.ImageRepository,
 		req.ImageDigest,
@@ -173,9 +210,10 @@ func requestFingerprint(req work.JobRequest) string {
 		req.ToolName,
 		req.Version,
 		req.CasHash,
-		strings.Join(actions, ","),
-		req.RequestedFixtureSet,
-	} {
+	)
+	fields = append(fields, actions...)
+	fields = append(fields, req.RequestedFixtureSet)
+	for _, field := range fields {
 		h.Write([]byte(field))
 		h.Write([]byte{0}) // separator — prevents field-concatenation collisions
 	}

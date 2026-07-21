@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -395,6 +396,76 @@ func TestCreateJob_ConcurrentDuplicateValidationRequestID_OneJobWins(t *testing.
 	}
 	if len(all) != 1 {
 		t.Fatalf("jobs actually persisted = %d, want 1 (all %d callers must share one job)", len(all), workers)
+	}
+}
+
+// TestCreateJob_SameValidationRequestIDActionsContainingComma_Rejected is a
+// regression guard for a fingerprint bug an independent review caught:
+// requestFingerprint used to join RequestedActions with a bare comma before
+// hashing, so an action list containing a literal comma (["a,b"]) fingerprinted
+// identically to a two-element list (["a", "b"]). That silently defeated the
+// "same validation_request_id + different payload -> rejected" guarantee for
+// any caller whose action names happen to contain commas.
+func TestCreateJob_SameValidationRequestIDActionsContainingComma_Rejected(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	first := sampleRequest("job-a")
+	first.ValidationRequestID = "vr-comma"
+	first.RequestedActions = []work.Action{"a,b"}
+	if _, err := store.CreateJob(ctx, first); err != nil {
+		t.Fatalf("first CreateJob: %v", err)
+	}
+
+	second := sampleRequest("job-b")
+	second.ValidationRequestID = "vr-comma"
+	second.RequestedActions = []work.Action{"a", "b"}
+	_, err := store.CreateJob(ctx, second)
+	if !errors.Is(err, work.ErrValidationRequestConflict) {
+		t.Fatalf(`err = %v, want ErrValidationRequestConflict (["a,b"] and ["a","b"] must not fingerprint-collide)`, err)
+	}
+}
+
+// TestMigrateValidationRequestID_ConcurrentStoreOpens_BothSucceed is a
+// regression guard for a migration race an independent review caught and
+// reproduced: opening the same pre-existing (pre-migration) database from
+// multiple connections concurrently — modeling two processes starting at
+// once, e.g. a rolling restart where the old and new Pod briefly overlap —
+// used to race a plain "check column, then ALTER TABLE ADD COLUMN" across
+// connections, and one of them would fail with "duplicate column name"
+// because its check ran before the other's ALTER committed. New's
+// _txlock=immediate DSN option plus running the check-and-ALTER inside one
+// transaction (see migrateValidationRequestID) closes that race: the second
+// opener's BeginTx blocks until the first's migration transaction commits.
+func TestMigrateValidationRequestID_ConcurrentStoreOpens_BothSucceed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-migration-concurrent.sqlite")
+	seedPreMigrationJobsTable(t, path, "job-old-1", "job-old-2")
+
+	const openers = 4
+	var wg sync.WaitGroup
+	errs := make([]error, openers)
+	stores := make([]*sqlite.Store, openers)
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, err := sqlite.New(path)
+			errs[i] = err
+			stores[i] = s
+		}(i)
+	}
+	wg.Wait()
+
+	for _, s := range stores {
+		if s != nil {
+			t.Cleanup(func() { _ = s.Close() })
+		}
+	}
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("opener %d: sqlite.New failed: %v", i, err)
+		}
 	}
 }
 
