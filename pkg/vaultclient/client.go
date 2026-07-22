@@ -57,13 +57,56 @@ type PortObservation struct {
 	NonEmpty  bool   `json:"non_empty"`
 }
 
+// Stage identifies which validation pipeline stage produced a record.
+// NodeVault uses this (together with Terminal) to decide whether a record
+// only promotes a ValidationRequestRecord to Running, or closes it out to
+// Succeeded/Failed. In the current worker pipeline (see pkg/worker) stages
+// always run in this fixed order and never skip ahead based on
+// requested_actions yet — L5A is therefore never terminal (L5B always
+// follows it) and L5B always is. Once requested_actions actually selects
+// which stages run (see PR5 in the platform roadmap), Terminal must be
+// computed from that instead of this fixed assumption.
+const (
+	StageL3  = "L3"
+	StageL4  = "L4"
+	StageL5A = "L5A"
+	StageL5B = "L5B"
+)
+
+// FailureKind classifies why a stage failed, distinct from which stage
+// failed (Stage) — an infra-level failure (pod scheduling, OOM, timeout)
+// can happen at any stage, not just the ones historically assumed
+// infra-only. See pkg/worker's classifyFromPods/waitL5aJob, which already
+// compute this distinction; this just carries it over the wire instead of
+// discarding it.
+const (
+	FailureKindInfrastructure = "infrastructure"
+	FailureKindApplication    = "application"
+	FailureKindPolicy         = "policy"
+	FailureKindInternal       = "internal"
+)
+
 // SubmitCheckRecordRequest is the payload for POST /v1/validation/check-records.
 type SubmitCheckRecordRequest struct {
-	CheckID           string            `json:"check_id"`
-	ToolSpecDigest    string            `json:"tool_spec_digest,omitempty"`
-	ImageDigest       string            `json:"image_digest"`
-	ToolName          string            `json:"tool_name,omitempty"`
-	Version           string            `json:"version,omitempty"`
+	CheckID        string `json:"check_id"`
+	ToolSpecDigest string `json:"tool_spec_digest,omitempty"`
+	ImageDigest    string `json:"image_digest"`
+	ToolName       string `json:"tool_name,omitempty"`
+	Version        string `json:"version,omitempty"`
+
+	// ValidationRequestID/SentinelJobID correlate this record back to the
+	// NodeVault-issued ValidationRequestRecord and this record's own
+	// NodeSentinel job — see index.ValidationRequestRecord (NodeVault).
+	ValidationRequestID string `json:"validation_request_id,omitempty"`
+	SentinelJobID       string `json:"sentinel_job_id,omitempty"`
+
+	// Stage/Terminal tell NodeVault where this record sits in the pipeline:
+	// Terminal=false only ever promotes Queued->Running; only a
+	// Terminal=true record closes the ValidationRequestRecord out to
+	// Succeeded/Failed. See the Stage consts' doc comment.
+	Stage    string `json:"stage"`
+	Terminal bool   `json:"terminal"`
+
 	ValidationStatus  string            `json:"validation_status"`
 	ValidationHash    string            `json:"validation_hash,omitempty"`
 	Command           string            `json:"command,omitempty"`
@@ -76,14 +119,31 @@ type SubmitCheckRecordRequest struct {
 	Timeout           bool              `json:"timeout,omitempty"`
 	AllOutputsPresent bool              `json:"all_outputs_present,omitempty"`
 	ContractResult    string            `json:"contract_result,omitempty"`
-	FailureReason     string            `json:"failure_reason,omitempty"`
+
+	// FailureKind/FailureCode/Retryable are set only when ValidationStatus
+	// != "succeeded" — see the FailureKind consts' doc comment.
+	FailureKind   string `json:"failure_kind,omitempty"`
+	FailureCode   string `json:"failure_code,omitempty"`
+	Retryable     bool   `json:"retryable,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 // SubmitScanRecordRequest is the payload for POST /v1/validation/scan-records.
 type SubmitScanRecordRequest struct {
-	ScanID         string `json:"scan_id"`
-	ImageDigest    string `json:"image_digest"`
-	ToolName       string `json:"tool_name,omitempty"`
+	ScanID      string `json:"scan_id"`
+	ImageDigest string `json:"image_digest"`
+	ToolName    string `json:"tool_name,omitempty"`
+
+	// See SubmitCheckRecordRequest's doc comments — same correlation and
+	// stage-position contract. A scan record has no ValidationStatus/
+	// FailureKind of its own (see submitNotAvailableScanRecord — an
+	// unavailable scanner is not a validation failure); PolicyResult
+	// carries the closest equivalent when this record is Terminal.
+	ValidationRequestID string `json:"validation_request_id,omitempty"`
+	SentinelJobID       string `json:"sentinel_job_id,omitempty"`
+	Stage               string `json:"stage"`
+	Terminal            bool   `json:"terminal"`
+
 	Scanner        string `json:"scanner,omitempty"`
 	ScannerVersion string `json:"scanner_version,omitempty"`
 	Source         string `json:"source,omitempty"`

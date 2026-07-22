@@ -46,6 +46,18 @@ func (f failingStore) ListJobs(context.Context, work.Status) ([]*work.Job, error
 	return nil, errors.New("not implemented")
 }
 
+func (f failingStore) MarkResultDeliveryPending(context.Context, string, string, string) error {
+	return errors.New("not implemented")
+}
+
+func (f failingStore) MarkResultDeliveryAcknowledged(context.Context, string) error {
+	return errors.New("not implemented")
+}
+
+func (f failingStore) ListPendingDeliveries(context.Context) ([]*work.Job, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f failingStore) Close() error {
 	return nil
 }

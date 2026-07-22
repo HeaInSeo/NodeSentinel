@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   requested_fixture_set TEXT NOT NULL,
   validation_request_id TEXT,
   request_fingerprint TEXT NOT NULL DEFAULT '',
+  result_delivery_status TEXT NOT NULL DEFAULT 'not_applicable',
+  result_delivery_payload TEXT NOT NULL DEFAULT '',
+  result_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  result_delivery_last_error TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -79,6 +83,47 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 	}
 	if err := s.migrateValidationRequestID(ctx); err != nil {
 		return fmt.Errorf("migrate validation_request_id: %w", err)
+	}
+	if err := s.migrateResultDelivery(ctx); err != nil {
+		return fmt.Errorf("migrate result_delivery: %w", err)
+	}
+	return nil
+}
+
+// migrateResultDelivery adds the result_delivery_* columns (see
+// work.Job.ResultDeliveryStatus) to a jobs table created before this
+// migration existed. Unlike migrateValidationRequestID these columns carry
+// no UNIQUE constraint, so there's no partial-index migration hazard —
+// but the same cross-connection "check column, then ALTER" race still
+// applies, so this follows the same one-transaction pattern (see
+// migrateValidationRequestID's doc comment).
+func (s *Store) migrateResultDelivery(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	cols := []struct{ name, ddl string }{
+		{"result_delivery_status", `ALTER TABLE jobs ADD COLUMN result_delivery_status TEXT NOT NULL DEFAULT 'not_applicable'`},
+		{"result_delivery_payload", `ALTER TABLE jobs ADD COLUMN result_delivery_payload TEXT NOT NULL DEFAULT ''`},
+		{"result_delivery_attempts", `ALTER TABLE jobs ADD COLUMN result_delivery_attempts INTEGER NOT NULL DEFAULT 0`},
+		{"result_delivery_last_error", `ALTER TABLE jobs ADD COLUMN result_delivery_last_error TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, c := range cols {
+		has, hasErr := hasColumn(ctx, tx, "jobs", c.name)
+		if hasErr != nil {
+			return hasErr
+		}
+		if !has {
+			if _, execErr := tx.ExecContext(ctx, c.ddl); execErr != nil {
+				return fmt.Errorf("add %s column: %w", c.name, execErr)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
 	}
 	return nil
 }
@@ -447,7 +492,8 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
 	const query = `
 SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
-       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at
+       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
+       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
 FROM jobs
 WHERE job_id = ?
 `
@@ -466,7 +512,8 @@ func (s *Store) ListJobs(ctx context.Context, status work.Status) ([]*work.Job, 
 	query := `
 SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
-       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at
+       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
+       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
 FROM jobs
 `
 	args := []any{}
@@ -496,20 +543,91 @@ FROM jobs
 	return out, nil
 }
 
+// MarkResultDeliveryPending records that jobID's terminal validation-result
+// record failed to deliver to NodeVault. payload is the pre-serialized
+// request to redeliver (opaque to this package); lastError is stored for
+// operator visibility. Increments result_delivery_attempts so repeated
+// failures are visible without a separate attempts table.
+func (s *Store) MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string) error {
+	now := time.Now().UTC()
+	const q = `
+UPDATE jobs
+SET result_delivery_status = 'pending', result_delivery_payload = ?,
+    result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?, updated_at = ?
+WHERE job_id = ?
+`
+	res, err := s.db.ExecContext(ctx, q, payload, lastError, now.Format(time.RFC3339Nano), jobID)
+	if err != nil {
+		return fmt.Errorf("mark result delivery pending: %w", err)
+	}
+	return ensureAffected(res)
+}
+
+// MarkResultDeliveryAcknowledged records that NodeVault durably accepted
+// jobID's terminal record. Clears the stored payload — it's no longer
+// needed once delivery is confirmed.
+func (s *Store) MarkResultDeliveryAcknowledged(ctx context.Context, jobID string) error {
+	now := time.Now().UTC()
+	const q = `
+UPDATE jobs
+SET result_delivery_status = 'acknowledged', result_delivery_payload = '', result_delivery_last_error = '', updated_at = ?
+WHERE job_id = ?
+`
+	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
+	if err != nil {
+		return fmt.Errorf("mark result delivery acknowledged: %w", err)
+	}
+	return ensureAffected(res)
+}
+
+// ListPendingDeliveries returns every job whose terminal record is still
+// awaiting successful redelivery, oldest first — so a long-stuck delivery
+// isn't starved behind a stream of newly-pending ones.
+func (s *Store) ListPendingDeliveries(ctx context.Context) ([]*work.Job, error) {
+	const query = `
+SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
+       version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
+       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
+       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
+FROM jobs
+WHERE result_delivery_status = 'pending'
+ORDER BY updated_at ASC
+`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list pending deliveries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*work.Job
+	for rows.Next() {
+		job, scanErr := scanJob(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan pending delivery: %w", scanErr)
+		}
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending deliveries: %w", err)
+	}
+	return out, nil
+}
+
 type scanner func(dest ...any) error
 
 func scanJob(scan scanner) (*work.Job, error) {
 	var (
-		actionsJSON         string
-		validationRequestID sql.NullString
-		status              string
-		leaseOwner          string
-		leaseUntil          sql.NullString
-		lastError           string
-		result              string
-		createdAt           string
-		updatedAt           string
-		job                 work.Job
+		actionsJSON          string
+		validationRequestID  sql.NullString
+		status               string
+		leaseOwner           string
+		leaseUntil           sql.NullString
+		lastError            string
+		result               string
+		createdAt            string
+		updatedAt            string
+		resultDeliveryStatus string
+		job                  work.Job
 	)
 
 	err := scan(
@@ -532,11 +650,16 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&result,
 		&createdAt,
 		&updatedAt,
+		&resultDeliveryStatus,
+		&job.ResultDeliveryPayload,
+		&job.ResultDeliveryAttempts,
+		&job.ResultDeliveryLastError,
 	)
 	if err != nil {
 		return nil, err
 	}
 	job.ValidationRequestID = validationRequestID.String
+	job.ResultDeliveryStatus = work.DeliveryStatus(resultDeliveryStatus)
 
 	var actions []work.Action
 	if unmarshalErr := json.Unmarshal([]byte(actionsJSON), &actions); unmarshalErr != nil {

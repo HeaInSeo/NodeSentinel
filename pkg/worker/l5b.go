@@ -76,9 +76,17 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 	}
 
 	req := vaultclient.SubmitScanRecordRequest{
-		ScanID:         scanID,
-		ImageDigest:    job.ImageDigest,
-		ToolName:       job.ToolName,
+		ScanID:              scanID,
+		ImageDigest:         job.ImageDigest,
+		ToolName:            job.ToolName,
+		ValidationRequestID: job.ValidationRequestID,
+		SentinelJobID:       job.JobID,
+		// L5-b is always the terminal record in the current fixed pipeline
+		// (nothing runs after it) — see checkRecordSubmission's doc comment
+		// on why this will need to become conditional once requested_actions
+		// actually selects which stages run.
+		Stage:          vaultclient.StageL5B,
+		Terminal:       true,
 		Scanner:        matched.Scanner,
 		ScannerVersion: matched.ScannerVersion,
 		Source:         "trivy-operator",
@@ -91,6 +99,7 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 	}
 	if _, err := w.vaultClient.SubmitScanRecord(ctx, req); err != nil {
 		logger.Error("L5-b: failed to submit scan record", "scan_id", scanID, "err", err)
+		w.markScanDeliveryPending(ctx, logger, job, req, err)
 		return err
 	}
 	logger.Info("L5-b scan record submitted",
@@ -101,16 +110,21 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.Logger, job *work.Job) error {
 	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
 	req := vaultclient.SubmitScanRecordRequest{
-		ScanID:       scanID,
-		ImageDigest:  job.ImageDigest,
-		ToolName:     job.ToolName,
-		Scanner:      "trivy-operator",
-		Source:       "not-available",
-		PolicyMode:   "record_only",
-		PolicyResult: "not-available",
+		ScanID:              scanID,
+		ImageDigest:         job.ImageDigest,
+		ToolName:            job.ToolName,
+		ValidationRequestID: job.ValidationRequestID,
+		SentinelJobID:       job.JobID,
+		Stage:               vaultclient.StageL5B,
+		Terminal:            true,
+		Scanner:             "trivy-operator",
+		Source:              "not-available",
+		PolicyMode:          "record_only",
+		PolicyResult:        "not-available",
 	}
 	if _, err := w.vaultClient.SubmitScanRecord(ctx, req); err != nil {
 		logger.Error("L5-b: failed to submit not-available scan record", "err", err)
+		w.markScanDeliveryPending(ctx, logger, job, req, err)
 		return err
 	}
 	return nil

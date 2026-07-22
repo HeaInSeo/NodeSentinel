@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -52,6 +53,8 @@ func (w *Worker) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		w.retryPendingDeliveries(ctx)
+
 		job, err := w.store.LeaseJob(ctx, w.workerName, leaseDuration)
 		if err != nil {
 			if errors.Is(err, work.ErrNoAvailableJob) {
@@ -89,6 +92,8 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	// L3: dry-run admission check — no actual Job created.
 	if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
 		logger.Warn("L3 dry-run failed", "err", err)
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run",
+			err.Error(), vaultclient.FailureKindInfrastructure, true)
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, "L3 dry-run: "+err.Error(), true)
 		return
 	}
@@ -100,6 +105,12 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 
 	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec)
 	if !result.success {
+		failureKind := vaultclient.FailureKindInfrastructure
+		if !result.retryable {
+			failureKind = vaultclient.FailureKindApplication
+		}
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "smoke-run",
+			result.reason, failureKind, result.retryable)
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, result.reason, result.retryable)
 		return
 	}
@@ -120,6 +131,54 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		logger.Error("CompleteJob failed", "err", err)
 	}
 	logger.Info("job completed", "summary", summary)
+}
+
+// reportTerminalFailure submits a terminal CheckRecord for a validation
+// request that died at stage (L3 or L4), before ever reaching L5. Without
+// this, NodeVault's ValidationRequestRecord for this job would stay stuck
+// at Queued/Running forever: NodeSentinel's own SQLite job state moves to
+// Failed via the caller's FailJob call regardless, but that's local state
+// NodeVault never otherwise sees. Best-effort — a submission failure here
+// is only logged; redelivery is handled by the pending-delivery retry in
+// Run's poll loop, not inline here.
+func (w *Worker) reportTerminalFailure(
+	ctx context.Context, logger *slog.Logger, job *work.Job,
+	stage, command, failureReason, failureKind string, retryable bool,
+) {
+	if w.vaultClient == nil {
+		return
+	}
+	validationStatus := "infra_failed"
+	if failureKind == vaultclient.FailureKindApplication {
+		validationStatus = "failed"
+	}
+	sub := checkRecordSubmission{
+		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
+		stage:            stage,
+		terminal:         true,
+		command:          command,
+		validationStatus: validationStatus,
+		failureKind:      failureKind,
+		failureReason:    failureReason,
+		retryable:        retryable,
+	}
+	if err := w.submitCheckRecord(ctx, logger, job, sub); err != nil {
+		logger.Error("failed to report pipeline failure to NodeVault", "stage", stage, "err", err)
+	}
+}
+
+// stageCheckIDPrefix returns the lowercase CheckID prefix for stage,
+// matching the l5a-/l5b- convention already used by pkg/worker's L5 check
+// IDs.
+func stageCheckIDPrefix(stage string) string {
+	switch stage {
+	case vaultclient.StageL3:
+		return "l3"
+	case vaultclient.StageL4:
+		return "l4"
+	default:
+		return "unknown"
+	}
 }
 
 func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job) error {

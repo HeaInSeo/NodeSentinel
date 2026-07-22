@@ -92,8 +92,11 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 	created, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(l5aCtx, jobSpec, metav1.CreateOptions{})
 	if err != nil {
 		logger.Warn("L5-a job creation failed", "err", err)
-		return w.submitCheckRecord(ctx, logger, job, checkID, command, 0,
-			"infra_failed", "", "infra-level: job creation failed: "+err.Error(), 0, false)
+		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
+			checkID: checkID, stage: vaultclient.StageL5A, command: command,
+			validationStatus: "infra_failed", failureKind: vaultclient.FailureKindInfrastructure,
+			failureReason: "infra-level: job creation failed: " + err.Error(), retryable: true,
+		})
 	}
 	logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 
@@ -107,17 +110,25 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 	switch {
 	case isInfra && runErr != nil:
 		logger.Warn("L5-a infra-level failure", "err", runErr)
-		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
-			"infra_failed", "", runErr.Error(), durationSec, false)
+		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
+			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			validationStatus: "infra_failed", failureKind: vaultclient.FailureKindInfrastructure,
+			failureReason: runErr.Error(), retryable: true,
+		})
 	case runErr != nil:
 		logger.Info("L5-a application-level failure", "exit_code", exitCode, "err", runErr)
-		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
-			"failed", "", runErr.Error(), durationSec, false)
+		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
+			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			validationStatus: "failed", failureKind: vaultclient.FailureKindApplication,
+			failureReason: runErr.Error(), retryable: false,
+		})
 	default:
 		validationHash := computeValidationHash(job.ImageDigest, command, exitCode)
 		logger.Info("L5-a validation succeeded", "validation_hash", validationHash)
-		return w.submitCheckRecord(ctx, logger, job, checkID, command, exitCode,
-			"succeeded", validationHash, "", durationSec, true)
+		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
+			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			validationStatus: "succeeded", validationHash: validationHash, allOutputsPresent: true,
+		})
 	}
 }
 
@@ -188,18 +199,37 @@ func isInfraReason(reason string) bool {
 
 // submitCheckRecord builds and sends a SubmitCheckRecordRequest to NodeVault.
 // Returns the submission error (if any) so the caller can propagate it.
+// checkRecordSubmission holds one call site's worth of "what happened at
+// this stage" — everything submitCheckRecord needs beyond the job itself.
+// Used both by L5-a (stage=L5A, terminal always false — L5-b always
+// follows it in the current fixed pipeline) and by worker.go's L3/L4
+// failure reporting (stage=L3|L4, terminal=true — the pipeline stops
+// there). See vaultclient's Stage/FailureKind consts for the fixed-pipeline
+// caveat: once requested_actions actually selects which stages run,
+// terminal must be computed from that instead of being hardcoded per call
+// site as it is today.
+type checkRecordSubmission struct {
+	checkID           string
+	stage             string // vaultclient.StageL3 | StageL4 | StageL5A
+	terminal          bool
+	command           string
+	exitCode          int
+	validationStatus  string // "succeeded" | "infra_failed" | "app_failed"
+	validationHash    string
+	failureKind       string // vaultclient.FailureKindInfrastructure | FailureKindApplication | ""
+	failureReason     string
+	retryable         bool
+	durationSec       int64
+	allOutputsPresent bool
+}
+
+// submitCheckRecord builds and sends a SubmitCheckRecordRequest to NodeVault.
+// Returns the submission error (if any) so the caller can propagate it.
 func (w *Worker) submitCheckRecord(
-	ctx context.Context,
-	logger *slog.Logger,
-	job *work.Job,
-	checkID, command string,
-	exitCode int,
-	validationStatus, validationHash, failureReason string,
-	durationSec int64,
-	allOutputsPresent bool,
+	ctx context.Context, logger *slog.Logger, job *work.Job, sub checkRecordSubmission,
 ) error {
 	var contractResult string
-	switch validationStatus {
+	switch sub.validationStatus {
 	case "succeeded":
 		contractResult = "passed"
 	case "infra_failed":
@@ -209,26 +239,35 @@ func (w *Worker) submitCheckRecord(
 	}
 
 	req := vaultclient.SubmitCheckRecordRequest{
-		CheckID:           checkID,
-		ToolSpecDigest:    job.CasHash,
-		ImageDigest:       job.ImageDigest,
-		ToolName:          job.ToolName,
-		Version:           job.Version,
-		ValidationStatus:  validationStatus,
-		ValidationHash:    validationHash,
-		Command:           command,
-		ExitCode:          exitCode,
-		DurationSeconds:   durationSec,
-		AllOutputsPresent: allOutputsPresent,
-		ContractResult:    contractResult,
-		FailureReason:     failureReason,
+		CheckID:             sub.checkID,
+		ToolSpecDigest:      job.CasHash,
+		ImageDigest:         job.ImageDigest,
+		ToolName:            job.ToolName,
+		Version:             job.Version,
+		ValidationRequestID: job.ValidationRequestID,
+		SentinelJobID:       job.JobID,
+		Stage:               sub.stage,
+		Terminal:            sub.terminal,
+		ValidationStatus:    sub.validationStatus,
+		ValidationHash:      sub.validationHash,
+		Command:             sub.command,
+		ExitCode:            sub.exitCode,
+		DurationSeconds:     sub.durationSec,
+		AllOutputsPresent:   sub.allOutputsPresent,
+		ContractResult:      contractResult,
+		FailureKind:         sub.failureKind,
+		Retryable:           sub.retryable,
+		FailureReason:       sub.failureReason,
 	}
 	if _, err := w.vaultClient.SubmitCheckRecord(ctx, req); err != nil {
-		logger.Error("L5-a: failed to submit check record to NodeVault",
-			"check_id", checkID, "err", err)
+		logger.Error("failed to submit check record to NodeVault",
+			"check_id", sub.checkID, "stage", sub.stage, "err", err)
+		if sub.terminal {
+			w.markCheckDeliveryPending(ctx, logger, job, req, err)
+		}
 		return err
 	}
-	logger.Info("L5-a check record submitted", "check_id", checkID, "status", validationStatus)
+	logger.Info("check record submitted", "check_id", sub.checkID, "stage", sub.stage, "status", sub.validationStatus)
 	return nil
 }
 

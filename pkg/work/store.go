@@ -56,6 +56,24 @@ type JobRequest struct {
 	ValidationRequestID string
 }
 
+// DeliveryStatus tracks whether a job's terminal validation-result record
+// has been durably accepted by NodeVault. Only a job's one terminal record
+// is tracked this way — see MarkResultDeliveryPending's doc comment for why
+// non-terminal records don't need the same guarantee.
+type DeliveryStatus string
+
+const (
+	// DeliveryNotApplicable is the default for every job — no terminal
+	// record delivery has been attempted (or none is expected) yet.
+	DeliveryNotApplicable DeliveryStatus = "not_applicable"
+	// DeliveryPending means the terminal record's first delivery attempt
+	// failed; ResultDeliveryPayload holds what to redeliver.
+	DeliveryPending DeliveryStatus = "pending"
+	// DeliveryAcknowledged means NodeVault has durably accepted the
+	// terminal record — the payload is cleared once this is set.
+	DeliveryAcknowledged DeliveryStatus = "acknowledged"
+)
+
 type Job struct {
 	JobID               string
 	ArtifactKind        string
@@ -76,6 +94,13 @@ type Job struct {
 	ResultSummary       string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+
+	// ResultDelivery* track redelivery of this job's one terminal
+	// validation-result record — see MarkResultDeliveryPending.
+	ResultDeliveryStatus    DeliveryStatus
+	ResultDeliveryPayload   string // opaque to this package — see pkg/worker's pendingDelivery
+	ResultDeliveryAttempts  int
+	ResultDeliveryLastError string
 }
 
 type Store interface {
@@ -86,5 +111,18 @@ type Store interface {
 	FailJob(ctx context.Context, jobID, worker, lastError string, retryable bool) error
 	GetJob(ctx context.Context, jobID string) (*Job, error)
 	ListJobs(ctx context.Context, status Status) ([]*Job, error)
+
+	// MarkResultDeliveryPending durably records that job's terminal
+	// validation-result record failed to deliver to NodeVault, along with
+	// the (opaque, pre-serialized) payload needed to retry it and the error
+	// that caused this attempt to fail. Increments ResultDeliveryAttempts.
+	MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string) error
+	// MarkResultDeliveryAcknowledged records that NodeVault durably
+	// accepted job's terminal record — clears the stored payload.
+	MarkResultDeliveryAcknowledged(ctx context.Context, jobID string) error
+	// ListPendingDeliveries returns every job whose terminal record is
+	// still awaiting successful redelivery, oldest first.
+	ListPendingDeliveries(ctx context.Context) ([]*Job, error)
+
 	Close() error
 }

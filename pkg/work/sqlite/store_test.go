@@ -469,6 +469,90 @@ func TestMigrateValidationRequestID_ConcurrentStoreOpens_BothSucceed(t *testing.
 	}
 }
 
+// TestMigrateResultDelivery_ExistingRowsSurvive mirrors
+// TestMigrateValidationRequestID_ExistingRowsSurvive for the result_delivery_*
+// columns: opening a pre-existing jobs table (seeded before this migration
+// existed) must succeed and default every existing row to "not_applicable",
+// not error or silently leave rows unreadable.
+func TestMigrateResultDelivery_ExistingRowsSurvive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-migration-delivery.sqlite")
+	seedPreMigrationJobsTable(t, path, "job-old-1", "job-old-2")
+
+	store, err := sqlite.New(path)
+	if err != nil {
+		t.Fatalf("sqlite.New on a pre-migration DB: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, id := range []string{"job-old-1", "job-old-2"} {
+		got, getErr := store.GetJob(context.Background(), id)
+		if getErr != nil {
+			t.Fatalf("GetJob(%q) after migration: %v", id, getErr)
+		}
+		if got.ResultDeliveryStatus != work.DeliveryNotApplicable {
+			t.Errorf("GetJob(%q).ResultDeliveryStatus = %q, want %q",
+				id, got.ResultDeliveryStatus, work.DeliveryNotApplicable)
+		}
+	}
+}
+
+// TestResultDelivery_PendingThenAcknowledged_Lifecycle exercises the store
+// methods directly (independent of pkg/worker): MarkResultDeliveryPending
+// makes a job visible in ListPendingDeliveries with the given payload;
+// MarkResultDeliveryAcknowledged removes it and clears the payload.
+func TestResultDelivery_PendingThenAcknowledged_Lifecycle(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	job, err := store.CreateJob(ctx, sampleRequest("job-delivery"))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if job.ResultDeliveryStatus != work.DeliveryNotApplicable {
+		t.Fatalf("initial ResultDeliveryStatus = %q, want not_applicable", job.ResultDeliveryStatus)
+	}
+
+	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom"); err != nil {
+		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	}
+
+	pending, err := store.ListPendingDeliveries(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingDeliveries: %v", err)
+	}
+	if len(pending) != 1 || pending[0].JobID != job.JobID {
+		t.Fatalf("ListPendingDeliveries = %v, want exactly [%s]", pending, job.JobID)
+	}
+	if pending[0].ResultDeliveryPayload != `{"kind":"check"}` {
+		t.Errorf("ResultDeliveryPayload = %q, want the stored payload", pending[0].ResultDeliveryPayload)
+	}
+	if pending[0].ResultDeliveryAttempts != 1 {
+		t.Errorf("ResultDeliveryAttempts = %d, want 1", pending[0].ResultDeliveryAttempts)
+	}
+
+	if err := store.MarkResultDeliveryAcknowledged(ctx, job.JobID); err != nil {
+		t.Fatalf("MarkResultDeliveryAcknowledged: %v", err)
+	}
+
+	pending, err = store.ListPendingDeliveries(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingDeliveries: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("ListPendingDeliveries after acknowledge = %v, want empty", pending)
+	}
+	got, err := store.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.ResultDeliveryStatus != work.DeliveryAcknowledged {
+		t.Errorf("ResultDeliveryStatus = %q, want acknowledged", got.ResultDeliveryStatus)
+	}
+	if got.ResultDeliveryPayload != "" {
+		t.Error("ResultDeliveryPayload should be cleared once acknowledged")
+	}
+}
+
 func newStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 
