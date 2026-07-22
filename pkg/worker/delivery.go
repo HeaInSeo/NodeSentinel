@@ -53,7 +53,15 @@ func backoffDuration(attempts int) time.Duration {
 		d = deliveryMaxBackoff
 	}
 	jitter := time.Duration(rand.Int63n(int64(d)/4 + 1)) //nolint:gosec // jitter timing, not security-sensitive
-	return d + jitter
+	total := d + jitter
+	// d alone is already clamped above, but d+jitter can still exceed
+	// deliveryMaxBackoff by up to 25% — clamp the total too, so the
+	// documented "capped at deliveryMaxBackoff" invariant actually holds
+	// for what callers receive, not just for the pre-jitter base.
+	if total > deliveryMaxBackoff {
+		total = deliveryMaxBackoff
+	}
+	return total
 }
 
 // markCheckDeliveryPending durably records that req (a terminal CheckRecord)
@@ -97,15 +105,15 @@ func (w *Worker) markDeliveryPendingOrDeadLetter(
 	ctx context.Context, logger *slog.Logger, jobID, payload string, deliverErr error, attempts int,
 ) {
 	if !vaultclient.Retryable(deliverErr) {
-		logger.Error("delivery permanently rejected — moving to dead letter", "job_id", jobID, "err", deliverErr)
+		logger.Error("delivery permanently rejected — moving to dead letter", "err", deliverErr)
 		if err := w.store.MarkResultDeliveryDeadLetter(ctx, jobID, deliverErr.Error()); err != nil {
-			logger.Error("failed to record dead-letter delivery", "job_id", jobID, "err", err)
+			logger.Error("failed to record dead-letter delivery", "err", err)
 		}
 		return
 	}
 	nextAttemptAt := time.Now().UTC().Add(backoffDuration(attempts))
 	if err := w.store.MarkResultDeliveryPending(ctx, jobID, payload, deliverErr.Error(), nextAttemptAt); err != nil {
-		logger.Error("failed to record pending result delivery", "job_id", jobID, "err", err)
+		logger.Error("failed to record pending result delivery", "err", err)
 	}
 }
 

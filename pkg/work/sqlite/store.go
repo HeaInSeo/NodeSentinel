@@ -34,6 +34,16 @@ func New(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite only ever supports one writer at a time regardless of how many
+	// Go-level connections are opened against it; database/sql's default
+	// pool otherwise happily opens several concurrent connections (Run's
+	// job-leasing loop, RunDeliveryLoop, and up to deliveryConcurrency
+	// parallel redeliverOne calls all touch this store from separate
+	// goroutines), which just pushes the same serialization down to
+	// SQLITE_BUSY retries via _busy_timeout instead of avoiding the
+	// contention. Capping the pool at one connection makes database/sql's
+	// own connection queue the single serialization point instead.
+	db.SetMaxOpenConns(1)
 
 	store := &Store{db: db}
 	if err := store.initSchema(context.Background()); err != nil {
