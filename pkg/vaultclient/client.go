@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -161,6 +162,33 @@ type SubmitResponse struct {
 	CertificationStatus string `json:"certification_status"`
 }
 
+// SubmitError wraps a non-2xx HTTP response from NodeVault's validation
+// endpoints, carrying the status code so callers (see pkg/worker/delivery.go)
+// can decide whether resubmitting the same payload could plausibly succeed.
+type SubmitError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *SubmitError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// Retryable reports whether err is worth resubmitting the same payload for:
+// true for a network-level failure (no SubmitError in the chain at all —
+// the request never got a response) or a 5xx server error; false for a 4xx
+// response, since NodeVault rejected THIS payload specifically — a 400
+// (malformed/invalid field, e.g. an unknown policy_result), a 409
+// (validation_request_id/CheckID content conflict, or an image_digest
+// mismatch) — and retrying it unchanged can never succeed.
+func Retryable(err error) bool {
+	var se *SubmitError
+	if errors.As(err, &se) {
+		return se.StatusCode >= 500
+	}
+	return true
+}
+
 // SubmitCheckRecord sends a ToolCheckRecord to NodeVault.
 func (c *Client) SubmitCheckRecord(ctx context.Context, req SubmitCheckRecordRequest) (*SubmitResponse, error) {
 	return c.post(ctx, c.baseURL+checkRecordsPath, req)
@@ -193,7 +221,7 @@ func (c *Client) post(ctx context.Context, url string, body any) (*SubmitRespons
 		return nil, fmt.Errorf("vaultclient: read response body: %w", readErr)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("vaultclient: POST %s: HTTP %d: %s", url, resp.StatusCode, respBody)
+		return nil, fmt.Errorf("vaultclient: POST %s: %w", url, &SubmitError{StatusCode: resp.StatusCode, Body: string(respBody)})
 	}
 
 	var result SubmitResponse

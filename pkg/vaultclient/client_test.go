@@ -3,6 +3,7 @@ package vaultclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -256,5 +257,70 @@ func TestSubmitCheckRecord_RequestBody(t *testing.T) {
 	}
 	if received.CheckID != "verify-body" {
 		t.Errorf("expected CheckID=verify-body in request body, got %q", received.CheckID)
+	}
+}
+
+// ── Retryable ─────────────────────────────────────────────────────────────────
+
+func TestRetryable_ServerError_True(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	_, err := c.SubmitCheckRecord(context.Background(), makeCheckReq())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !Retryable(err) {
+		t.Error("Retryable(500) = false, want true")
+	}
+}
+
+func TestRetryable_ClientError_False(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+	}{
+		{"bad request (e.g. invalid policy_result)", http.StatusBadRequest},
+		{"conflict (content fingerprint mismatch or digest mismatch)", http.StatusConflict},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "rejected", tt.code)
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL)
+			_, err := c.SubmitCheckRecord(context.Background(), makeCheckReq())
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if Retryable(err) {
+				t.Errorf("Retryable(%d) = true, want false — resubmitting the same payload cannot succeed", tt.code)
+			}
+		})
+	}
+}
+
+func TestRetryable_NetworkError_True(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // connection refused — no HTTP response at all
+
+	c := newTestClient(srv.URL)
+	_, err := c.SubmitCheckRecord(context.Background(), makeCheckReq())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !Retryable(err) {
+		t.Error("Retryable(network error) = false, want true")
+	}
+}
+
+func TestRetryable_NonSubmitError_DefaultsTrue(t *testing.T) {
+	if !Retryable(errors.New("some unrelated error")) {
+		t.Error("Retryable(non-SubmitError) = false, want true (fail open — assume transient)")
 	}
 }

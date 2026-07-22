@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   result_delivery_payload TEXT NOT NULL DEFAULT '',
   result_delivery_attempts INTEGER NOT NULL DEFAULT 0,
   result_delivery_last_error TEXT NOT NULL DEFAULT '',
+  next_attempt_at TEXT,
+  result_delivery_claimed_until TEXT,
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -109,6 +111,8 @@ func (s *Store) migrateResultDelivery(ctx context.Context) error {
 		{"result_delivery_payload", `ALTER TABLE jobs ADD COLUMN result_delivery_payload TEXT NOT NULL DEFAULT ''`},
 		{"result_delivery_attempts", `ALTER TABLE jobs ADD COLUMN result_delivery_attempts INTEGER NOT NULL DEFAULT 0`},
 		{"result_delivery_last_error", `ALTER TABLE jobs ADD COLUMN result_delivery_last_error TEXT NOT NULL DEFAULT ''`},
+		{"next_attempt_at", `ALTER TABLE jobs ADD COLUMN next_attempt_at TEXT`},
+		{"result_delivery_claimed_until", `ALTER TABLE jobs ADD COLUMN result_delivery_claimed_until TEXT`},
 	}
 	for _, c := range cols {
 		has, hasErr := hasColumn(ctx, tx, "jobs", c.name)
@@ -120,6 +124,11 @@ func (s *Store) migrateResultDelivery(ctx context.Context) error {
 				return fmt.Errorf("add %s column: %w", c.name, execErr)
 			}
 		}
+	}
+
+	const idx = `CREATE INDEX IF NOT EXISTS idx_jobs_result_delivery_status ON jobs(result_delivery_status, next_attempt_at)`
+	if _, err := tx.ExecContext(ctx, idx); err != nil {
+		return fmt.Errorf("create result_delivery_status index: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -488,16 +497,20 @@ WHERE job_id = ? AND lease_owner = ?
 	return ensureAffected(res)
 }
 
-func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
-	const query = `
+// jobSelectQuery is the shared column list for every query that scans a
+// full work.Job row via scanJob — kept in one place so GetJob, ListJobs,
+// and ClaimPendingDeliveries can never drift out of sync with each other or
+// with scanJob's own scan-destination order.
+const jobSelectQuery = `
 SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
        status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
-       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
-FROM jobs
-WHERE job_id = ?
-`
-	row := s.db.QueryRowContext(ctx, query, jobID)
+       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error,
+       next_attempt_at
+FROM jobs`
+
+func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
+	row := s.db.QueryRowContext(ctx, jobSelectQuery+" WHERE job_id = ?", jobID)
 	job, err := scanJob(row.Scan)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -509,13 +522,7 @@ WHERE job_id = ?
 }
 
 func (s *Store) ListJobs(ctx context.Context, status work.Status) ([]*work.Job, error) {
-	query := `
-SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
-       version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
-       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
-       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
-FROM jobs
-`
+	query := jobSelectQuery
 	args := []any{}
 	if status != "" {
 		query += " WHERE status = ?"
@@ -544,19 +551,23 @@ FROM jobs
 }
 
 // MarkResultDeliveryPending records that jobID's terminal validation-result
-// record failed to deliver to NodeVault. payload is the pre-serialized
-// request to redeliver (opaque to this package); lastError is stored for
-// operator visibility. Increments result_delivery_attempts so repeated
-// failures are visible without a separate attempts table.
-func (s *Store) MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string) error {
+// record needs (re)delivery. payload is the pre-serialized request to send
+// (opaque to this package); lastError is the most recent failure (empty for
+// the first mark, before any delivery attempt has run); nextAttemptAt gates
+// when ClaimPendingDeliveries may claim it again (backoff, computed by the
+// caller — see pkg/worker/delivery.go). Increments result_delivery_attempts
+// so repeated failures are visible without a separate attempts table.
+func (s *Store) MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string, nextAttemptAt time.Time) error {
 	now := time.Now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'pending', result_delivery_payload = ?,
-    result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?, updated_at = ?
+    result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?,
+    next_attempt_at = ?, result_delivery_claimed_until = NULL, updated_at = ?
 WHERE job_id = ?
 `
-	res, err := s.db.ExecContext(ctx, q, payload, lastError, now.Format(time.RFC3339Nano), jobID)
+	res, err := s.db.ExecContext(ctx, q, payload, lastError,
+		nextAttemptAt.UTC().Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), jobID)
 	if err != nil {
 		return fmt.Errorf("mark result delivery pending: %w", err)
 	}
@@ -570,7 +581,8 @@ func (s *Store) MarkResultDeliveryAcknowledged(ctx context.Context, jobID string
 	now := time.Now().UTC()
 	const q = `
 UPDATE jobs
-SET result_delivery_status = 'acknowledged', result_delivery_payload = '', result_delivery_last_error = '', updated_at = ?
+SET result_delivery_status = 'acknowledged', result_delivery_payload = '', result_delivery_last_error = '',
+    next_attempt_at = NULL, result_delivery_claimed_until = NULL, updated_at = ?
 WHERE job_id = ?
 `
 	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
@@ -580,35 +592,101 @@ WHERE job_id = ?
 	return ensureAffected(res)
 }
 
-// ListPendingDeliveries returns every job whose terminal record is still
-// awaiting successful redelivery, oldest first — so a long-stuck delivery
-// isn't starved behind a stream of newly-pending ones.
-func (s *Store) ListPendingDeliveries(ctx context.Context) ([]*work.Job, error) {
-	const query = `
-SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_name,
-       version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
-       status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
-       result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error
-FROM jobs
-WHERE result_delivery_status = 'pending'
-ORDER BY updated_at ASC
+// MarkResultDeliveryDeadLetter records that jobID's terminal record will not
+// be redelivered again (see work.DeliveryDeadLetter). Unlike
+// MarkResultDeliveryAcknowledged, the payload and lastError are preserved —
+// an operator needs them to diagnose or manually resubmit.
+func (s *Store) MarkResultDeliveryDeadLetter(ctx context.Context, jobID, lastError string) error {
+	now := time.Now().UTC()
+	const q = `
+UPDATE jobs
+SET result_delivery_status = 'dead_letter', result_delivery_last_error = ?,
+    next_attempt_at = NULL, result_delivery_claimed_until = NULL, updated_at = ?
+WHERE job_id = ?
 `
-	rows, err := s.db.QueryContext(ctx, query)
+	res, err := s.db.ExecContext(ctx, q, lastError, now.Format(time.RFC3339Nano), jobID)
 	if err != nil {
-		return nil, fmt.Errorf("list pending deliveries: %w", err)
+		return fmt.Errorf("mark result delivery dead letter: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	return ensureAffected(res)
+}
 
-	var out []*work.Job
+// ClaimPendingDeliveries atomically selects up to limit jobs eligible for
+// redelivery and marks them Delivering with a claim expiring after
+// claimTTL, all within one transaction — see work.Store.
+// ClaimPendingDeliveries's doc comment for why this must be atomic rather
+// than a plain SELECT.
+//
+// Eligible means either:
+//   - result_delivery_status = 'pending' AND (next_attempt_at IS NULL OR due), or
+//   - result_delivery_status = 'delivering' AND its claim already expired
+//     (a prior claimer crashed or hung before resolving it — this is the
+//     reclaim path; without it, a crash mid-delivery would leave the job
+//     stuck at 'delivering' forever, invisible to both this query, which
+//     only looks at 'pending', and the operator, since it's neither
+//     succeeded nor failed).
+func (s *Store) ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL time.Duration) ([]*work.Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+	const selectSQL = `
+SELECT job_id FROM jobs
+WHERE (result_delivery_status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+   OR (result_delivery_status = 'delivering' AND result_delivery_claimed_until < ?)
+ORDER BY updated_at ASC
+LIMIT ?
+`
+	rows, err := tx.QueryContext(ctx, selectSQL, nowStr, nowStr, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select claimable deliveries: %w", err)
+	}
+	var jobIDs []string
 	for rows.Next() {
-		job, scanErr := scanJob(rows.Scan)
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan claimable job_id: %w", scanErr)
+		}
+		jobIDs = append(jobIDs, id)
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("iterate claimable deliveries: %w", rowsErr)
+	}
+	if len(jobIDs) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit empty claim tx: %w", err)
+		}
+		return nil, nil
+	}
+
+	claimedUntil := now.Add(claimTTL).Format(time.RFC3339Nano)
+	const updateSQL = `
+UPDATE jobs
+SET result_delivery_status = 'delivering', result_delivery_claimed_until = ?, updated_at = ?
+WHERE job_id = ?
+`
+	out := make([]*work.Job, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		if _, err := tx.ExecContext(ctx, updateSQL, claimedUntil, nowStr, id); err != nil {
+			return nil, fmt.Errorf("claim job %q: %w", id, err)
+		}
+		row := tx.QueryRowContext(ctx, jobSelectQuery+" WHERE job_id = ?", id)
+		job, scanErr := scanJob(row.Scan)
 		if scanErr != nil {
-			return nil, fmt.Errorf("scan pending delivery: %w", scanErr)
+			return nil, fmt.Errorf("scan claimed job %q: %w", id, scanErr)
 		}
 		out = append(out, job)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending deliveries: %w", err)
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim tx: %w", err)
 	}
 	return out, nil
 }
@@ -627,6 +705,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		createdAt            string
 		updatedAt            string
 		resultDeliveryStatus string
+		nextAttemptAt        sql.NullString
 		job                  work.Job
 	)
 
@@ -654,6 +733,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&job.ResultDeliveryPayload,
 		&job.ResultDeliveryAttempts,
 		&job.ResultDeliveryLastError,
+		&nextAttemptAt,
 	)
 	if err != nil {
 		return nil, err
@@ -689,6 +769,14 @@ func scanJob(scan scanner) (*work.Job, error) {
 			return nil, fmt.Errorf("parse lease_until: %w", parseErr)
 		}
 		job.LeaseUntil = &ts
+	}
+
+	if nextAttemptAt.Valid && nextAttemptAt.String != "" {
+		ts, parseErr := time.Parse(time.RFC3339Nano, nextAttemptAt.String)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse next_attempt_at: %w", parseErr)
+		}
+		job.NextAttemptAt = &ts
 	}
 
 	return &job, nil

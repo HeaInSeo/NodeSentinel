@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -231,6 +234,24 @@ func TestRunL5b_NotAvailable_AlwaysTerminal(t *testing.T) {
 
 // ── Delivery-retry: terminal failures are tracked, non-terminal aren't ─────
 
+// forceDeliveryDueNow rewrites jobID's next_attempt_at to the past,
+// preserving its current payload/lastError, so a test can exercise
+// retryPendingDeliveries immediately after a natural first failure instead
+// of waiting out backoffDuration's real delay.
+func forceDeliveryDueNow(t *testing.T, store work.Store, jobID string) {
+	t.Helper()
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if err := store.MarkResultDeliveryPending(
+		context.Background(), jobID, job.ResultDeliveryPayload, job.ResultDeliveryLastError,
+		time.Now().Add(-time.Second),
+	); err != nil {
+		t.Fatalf("MarkResultDeliveryPending (force due now): %v", err)
+	}
+}
+
 // closedVaultClient returns a vaultclient pointed at an address nothing is
 // listening on, so every submit fails deterministically and fast.
 func closedVaultClient(t *testing.T) *vaultclient.Client {
@@ -294,7 +315,17 @@ func TestSubmitCheckRecord_NonTerminalDeliveryFailure_DoesNotMarkPending(t *test
 	}
 }
 
-func TestRetryPendingDeliveries_CheckRecord_Acknowledges(t *testing.T) {
+// These exercise redeliverOne directly (rather than through
+// retryPendingDeliveries/ClaimPendingDeliveries) so they test the
+// retry/backoff/acknowledge decision logic itself without needing to wait
+// out backoffDuration's real delay just to make a job claimable again — the
+// claim-eligibility scheduling (next_attempt_at gating, batch limit,
+// ordering, reclaim) is covered directly at the store level in
+// pkg/work/sqlite's tests. TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob
+// below covers the full retryPendingDeliveries -> ClaimPendingDeliveries ->
+// redeliverOne pipeline end to end.
+
+func TestRedeliverOne_CheckRecord_Acknowledges(t *testing.T) {
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -310,11 +341,15 @@ func TestRetryPendingDeliveries_CheckRecord_Acknowledges(t *testing.T) {
 		t.Fatal("expected initial submission to fail")
 	}
 
-	// Point the worker at a working server and retry.
+	// Point the worker at a working server and redeliver.
 	var captured []capturedSubmission
 	w.vaultClient = capturingVaultServer(t, &captured)
 
-	w.retryPendingDeliveries(context.Background())
+	pending, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	w.redeliverOne(context.Background(), pending)
 
 	if len(captured) != 1 {
 		t.Fatalf("redelivery attempts captured = %d, want 1", len(captured))
@@ -331,7 +366,7 @@ func TestRetryPendingDeliveries_CheckRecord_Acknowledges(t *testing.T) {
 	}
 }
 
-func TestRetryPendingDeliveries_StillFailing_IncrementsAttempts(t *testing.T) {
+func TestRedeliverOne_StillFailing_IncrementsAttemptsAndStaysPending(t *testing.T) {
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -348,8 +383,13 @@ func TestRetryPendingDeliveries_StillFailing_IncrementsAttempts(t *testing.T) {
 	}
 
 	// vaultClient still points at the (now permanently closed) server.
-	w.retryPendingDeliveries(context.Background())
-	w.retryPendingDeliveries(context.Background())
+	for i := 0; i < 2; i++ {
+		pending, getErr := store.GetJob(context.Background(), job.JobID)
+		if getErr != nil {
+			t.Fatalf("GetJob: %v", getErr)
+		}
+		w.redeliverOne(context.Background(), pending)
+	}
 
 	stored, err := store.GetJob(context.Background(), job.JobID)
 	if err != nil {
@@ -358,16 +398,19 @@ func TestRetryPendingDeliveries_StillFailing_IncrementsAttempts(t *testing.T) {
 	if stored.ResultDeliveryStatus != work.DeliveryPending {
 		t.Errorf("ResultDeliveryStatus = %q, want still pending", stored.ResultDeliveryStatus)
 	}
-	// 1 from the initial submitCheckRecord failure + 2 retries = 3.
+	// 1 from the initial submitCheckRecord failure + 2 redeliverOne calls = 3.
 	if stored.ResultDeliveryAttempts != 3 {
 		t.Errorf("ResultDeliveryAttempts = %d, want 3", stored.ResultDeliveryAttempts)
 	}
 	if stored.ResultDeliveryLastError == "" {
 		t.Error("ResultDeliveryLastError is empty, want the most recent failure")
 	}
+	if stored.NextAttemptAt == nil || !stored.NextAttemptAt.After(time.Now()) {
+		t.Error("NextAttemptAt should be set in the future (backoff) after a retryable failure")
+	}
 }
 
-func TestRetryPendingDeliveries_ScanRecord_Acknowledges(t *testing.T) {
+func TestRedeliverOne_ScanRecord_Acknowledges(t *testing.T) {
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -381,7 +424,11 @@ func TestRetryPendingDeliveries_ScanRecord_Acknowledges(t *testing.T) {
 
 	var captured []capturedSubmission
 	w.vaultClient = capturingVaultServer(t, &captured)
-	w.retryPendingDeliveries(context.Background())
+	pending, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	w.redeliverOne(context.Background(), pending)
 
 	if len(captured) != 1 {
 		t.Fatalf("redelivery attempts captured = %d, want 1", len(captured))
@@ -395,6 +442,127 @@ func TestRetryPendingDeliveries_ScanRecord_Acknowledges(t *testing.T) {
 	}
 	if stored.ResultDeliveryStatus != work.DeliveryAcknowledged {
 		t.Errorf("ResultDeliveryStatus = %q, want acknowledged", stored.ResultDeliveryStatus)
+	}
+}
+
+// TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob covers the full
+// public pipeline: retryPendingDeliveries -> ClaimPendingDeliveries (claims
+// a due job) -> redeliverOne -> acknowledged. Uses forceDeliveryDueNow so
+// the test doesn't have to wait out a real backoff delay.
+func TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob(t *testing.T) {
+	store := newTestStore(t)
+	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
+
+	job, err := store.CreateJob(context.Background(), newTestJob())
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	sub := checkRecordSubmission{
+		checkID: "l4-" + job.JobID, stage: vaultclient.StageL4, terminal: true,
+		validationStatus: "infra_failed", failureKind: vaultclient.FailureKindInfrastructure, retryable: true,
+	}
+	if err := w.submitCheckRecord(context.Background(), slog.Default(), job, sub); err == nil {
+		t.Fatal("expected initial submission to fail")
+	}
+	forceDeliveryDueNow(t, store, job.JobID)
+
+	var captured []capturedSubmission
+	w.vaultClient = capturingVaultServer(t, &captured)
+	w.retryPendingDeliveries(context.Background())
+
+	if len(captured) != 1 {
+		t.Fatalf("redelivery attempts captured = %d, want 1", len(captured))
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ResultDeliveryStatus != work.DeliveryAcknowledged {
+		t.Errorf("ResultDeliveryStatus = %q, want acknowledged", stored.ResultDeliveryStatus)
+	}
+}
+
+// TestProcess_L5aFails_L5bStillRunsAndSubmitsTerminal is a direct regression
+// guard for the L5-a/L5-b terminal contract: L5-a is never terminal
+// specifically because L5-b always runs after it in the current fixed
+// pipeline (see checkRecordSubmission's doc comment) — if that ordering
+// invariant ever broke (e.g. a future "return early on l5aErr" added to
+// process()), L5-a's failure would silently become the last word on this
+// validation request with no terminal record ever submitted, and
+// ValidationRequestRecord would stay stuck at Running forever. This locks
+// in that L5-b still runs, and still submits a Terminal record, even when
+// L5-a fails.
+func TestProcess_L5aFails_L5bStillRunsAndSubmitsTerminal(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	var captured []capturedSubmission
+	vc := capturingVaultServer(t, &captured)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	kube.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ga := action.(k8stesting.GetActionImpl)
+		if strings.HasPrefix(ga.GetName(), "l5a-") {
+			return true, fakeJobWithCondition(smokeNamespace, ga.GetName(), batchv1.JobFailed, corev1.ConditionTrue), nil
+		}
+		// The L4 smoke-run Job (name prefix "smoke-") completes normally.
+		return true, fakeJobWithCondition(smokeNamespace, ga.GetName(), batchv1.JobComplete, corev1.ConditionTrue), nil
+	})
+	w := New(store, kube, "test-worker").WithVaultClient(vc)
+
+	req := newTestJob()
+	req.JobID = "l5a-fail-job" // non-empty: extractPodExitCode's K8s label selector rejects "job-name=l5a-" (trailing '-') built from an empty JobID
+	created, err := store.CreateJob(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+
+	w.process(context.Background(), job)
+
+	var sawL5A, sawL5BTerminal bool
+	for _, c := range captured {
+		if strings.Contains(c.path, "check-records") {
+			got := c.decodeCheck(t)
+			if got.Stage == vaultclient.StageL5A {
+				sawL5A = true
+				if got.Terminal {
+					t.Error("L5-a record must not be Terminal")
+				}
+				if got.ValidationStatus == "succeeded" {
+					t.Error("L5-a record should reflect the injected failure, not succeeded")
+				}
+			}
+		}
+		if strings.Contains(c.path, "scan-records") {
+			got := c.decodeScan(t)
+			if got.Stage == vaultclient.StageL5B && got.Terminal {
+				sawL5BTerminal = true
+			}
+		}
+	}
+	if !sawL5A {
+		t.Error("expected an L5-a check record to have been submitted")
+	}
+	if !sawL5BTerminal {
+		t.Fatal("expected L5-b to still run and submit a Terminal record even though L5-a failed")
+	}
+
+	stored, err := store.GetJob(context.Background(), created.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	// L5-a/L5-b are best-effort — the WorkStore job itself still succeeds as
+	// long as L3/L4 passed. l5aErr in process() only reflects a failure to
+	// *submit* the record to NodeVault (an HTTP/transport failure), not an
+	// application-level validation failure — that's reported successfully,
+	// as a check record whose ValidationStatus is "failed" (asserted above).
+	if stored.Status != work.StatusSucceeded {
+		t.Errorf("job Status = %q, want succeeded (an L5-a application-level failure doesn't fail the WorkStore job)", stored.Status)
 	}
 }
 

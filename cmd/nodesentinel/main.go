@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/ingress"
@@ -48,22 +51,6 @@ func main() {
 		kube = nil
 	}
 
-	// Start L3/L4/L5 worker goroutine (only when K8s is reachable).
-	if kube != nil {
-		dynKube, dynErr := worker.NewDynamicKubeClient()
-		if dynErr != nil {
-			slog.Warn("dynamic K8s client unavailable — L5-b trivy scan will submit not-available records", "err", dynErr)
-		}
-		w := worker.New(store, kube, "nodesentinel-worker-0").
-			WithVaultClient(vaultclient.New()).
-			WithDynamicKubeClient(dynKube)
-		go func() {
-			slog.Info("worker started (L3/L4/L5)")
-			w.Run(ctx)
-			slog.Info("worker stopped")
-		}()
-	}
-
 	var listenConfig net.ListenConfig
 	lis, err := listenConfig.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
@@ -74,14 +61,58 @@ func main() {
 	grpcServer := grpc.NewServer()
 	nsv1.RegisterIngressServiceServer(grpcServer, ingress.NewServer(store))
 
-	go func() {
-		<-ctx.Done()
-		grpcServer.GracefulStop()
-	}()
+	// g supervises every long-running loop (job leasing, result-delivery
+	// retry, the gRPC server itself) so that any one of them exiting
+	// unexpectedly — not just SIGINT/SIGTERM — is surfaced via g.Wait()
+	// instead of leaving the process silently running degraded (e.g. still
+	// serving gRPC ingress with no worker actually processing jobs). gCtx
+	// is canceled both by the outer ctx (SIGINT/SIGTERM) and by any group
+	// member returning a non-nil error, which is what drives the graceful
+	// shutdown goroutine below on either trigger.
+	g, gCtx := errgroup.WithContext(ctx)
 
-	slog.Info("NodeSentinel ingress gRPC listening", "port", port)
-	if err := grpcServer.Serve(lis); err != nil {
-		slog.Error("serve grpc", "err", err)
+	// Start L3/L4/L5 worker + its delivery-retry loop (only when K8s is
+	// reachable) as two independent supervised goroutines — see
+	// worker.Run's doc comment for why a NodeVault outage stalling
+	// redelivery must never stall job leasing.
+	if kube != nil {
+		dynKube, dynErr := worker.NewDynamicKubeClient()
+		if dynErr != nil {
+			slog.Warn("dynamic K8s client unavailable — L5-b trivy scan will submit not-available records", "err", dynErr)
+		}
+		w := worker.New(store, kube, "nodesentinel-worker-0").
+			WithVaultClient(vaultclient.New()).
+			WithDynamicKubeClient(dynKube)
+
+		g.Go(func() error {
+			slog.Info("worker started (L3/L4/L5)")
+			err := w.Run(gCtx)
+			slog.Info("worker stopped", "err", err)
+			return err
+		})
+		g.Go(func() error {
+			slog.Info("delivery retry loop started")
+			err := w.RunDeliveryLoop(gCtx)
+			slog.Info("delivery retry loop stopped", "err", err)
+			return err
+		})
+	}
+
+	g.Go(func() error {
+		<-gCtx.Done()
+		grpcServer.GracefulStop()
+		return nil
+	})
+	g.Go(func() error {
+		slog.Info("NodeSentinel ingress gRPC listening", "port", port)
+		if err := grpcServer.Serve(lis); err != nil {
+			return fmt.Errorf("serve grpc: %w", err)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("nodesentinel exited with error", "err", err)
 		os.Exit(1)
 	}
 }

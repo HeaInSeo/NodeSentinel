@@ -47,14 +47,16 @@ func New(store work.Store, kube kubernetes.Interface, workerName string) *Worker
 	return &Worker{store: store, kube: kube, workerName: workerName}
 }
 
-// Run polls for queued jobs and processes them. It blocks until ctx is canceled.
-func (w *Worker) Run(ctx context.Context) {
+// Run polls for queued jobs and processes them. It blocks until ctx is
+// canceled, returning ctx.Err(). Deliberately does not also retry pending
+// result deliveries — see RunDeliveryLoop, started as an independent
+// goroutine (cmd/nodesentinel/main.go) specifically so a NodeVault outage
+// stalling redelivery can never stall job leasing.
+func (w *Worker) Run(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
-		w.retryPendingDeliveries(ctx)
-
 		job, err := w.store.LeaseJob(ctx, w.workerName, leaseDuration)
 		if err != nil {
 			if errors.Is(err, work.ErrNoAvailableJob) {
@@ -64,7 +66,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			case <-time.After(pollFrequency):
 			}
 			continue
@@ -73,7 +75,7 @@ func (w *Worker) Run(ctx context.Context) {
 			// No queued jobs — wait before polling again.
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			case <-time.After(pollFrequency):
 			}
 			continue

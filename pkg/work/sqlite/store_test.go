@@ -496,11 +496,12 @@ func TestMigrateResultDelivery_ExistingRowsSurvive(t *testing.T) {
 	}
 }
 
-// TestResultDelivery_PendingThenAcknowledged_Lifecycle exercises the store
-// methods directly (independent of pkg/worker): MarkResultDeliveryPending
-// makes a job visible in ListPendingDeliveries with the given payload;
-// MarkResultDeliveryAcknowledged removes it and clears the payload.
-func TestResultDelivery_PendingThenAcknowledged_Lifecycle(t *testing.T) {
+// TestResultDelivery_PendingClaimedThenAcknowledged_Lifecycle exercises the
+// store methods directly (independent of pkg/worker): MarkResultDeliveryPending
+// makes a job claimable; ClaimPendingDeliveries atomically claims it
+// (Delivering) and, once claimed, it's no longer returned by a second
+// claim call; MarkResultDeliveryAcknowledged then clears the payload.
+func TestResultDelivery_PendingClaimedThenAcknowledged_Lifecycle(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
 
@@ -512,34 +513,48 @@ func TestResultDelivery_PendingThenAcknowledged_Lifecycle(t *testing.T) {
 		t.Fatalf("initial ResultDeliveryStatus = %q, want not_applicable", job.ResultDeliveryStatus)
 	}
 
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom"); err != nil {
+	past := time.Now().UTC().Add(-time.Second) // already due
+	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
 		t.Fatalf("MarkResultDeliveryPending: %v", err)
 	}
 
-	pending, err := store.ListPendingDeliveries(ctx)
+	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
 	if err != nil {
-		t.Fatalf("ListPendingDeliveries: %v", err)
+		t.Fatalf("ClaimPendingDeliveries: %v", err)
 	}
-	if len(pending) != 1 || pending[0].JobID != job.JobID {
-		t.Fatalf("ListPendingDeliveries = %v, want exactly [%s]", pending, job.JobID)
+	if len(claimed) != 1 || claimed[0].JobID != job.JobID {
+		t.Fatalf("ClaimPendingDeliveries = %v, want exactly [%s]", claimed, job.JobID)
 	}
-	if pending[0].ResultDeliveryPayload != `{"kind":"check"}` {
-		t.Errorf("ResultDeliveryPayload = %q, want the stored payload", pending[0].ResultDeliveryPayload)
+	if claimed[0].ResultDeliveryPayload != `{"kind":"check"}` {
+		t.Errorf("ResultDeliveryPayload = %q, want the stored payload", claimed[0].ResultDeliveryPayload)
 	}
-	if pending[0].ResultDeliveryAttempts != 1 {
-		t.Errorf("ResultDeliveryAttempts = %d, want 1", pending[0].ResultDeliveryAttempts)
+	if claimed[0].ResultDeliveryAttempts != 1 {
+		t.Errorf("ResultDeliveryAttempts = %d, want 1", claimed[0].ResultDeliveryAttempts)
+	}
+	if claimed[0].ResultDeliveryStatus != work.DeliveryDelivering {
+		t.Errorf("ResultDeliveryStatus = %q, want delivering", claimed[0].ResultDeliveryStatus)
+	}
+
+	// A second claim call must not re-claim the same job — it's already
+	// Delivering with an unexpired claim.
+	second, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPendingDeliveries (second): %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("second ClaimPendingDeliveries = %v, want empty (already claimed)", second)
 	}
 
 	if err := store.MarkResultDeliveryAcknowledged(ctx, job.JobID); err != nil {
 		t.Fatalf("MarkResultDeliveryAcknowledged: %v", err)
 	}
 
-	pending, err = store.ListPendingDeliveries(ctx)
+	afterAck, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
 	if err != nil {
-		t.Fatalf("ListPendingDeliveries: %v", err)
+		t.Fatalf("ClaimPendingDeliveries (after ack): %v", err)
 	}
-	if len(pending) != 0 {
-		t.Fatalf("ListPendingDeliveries after acknowledge = %v, want empty", pending)
+	if len(afterAck) != 0 {
+		t.Fatalf("ClaimPendingDeliveries after acknowledge = %v, want empty", afterAck)
 	}
 	got, err := store.GetJob(ctx, job.JobID)
 	if err != nil {
@@ -550,6 +565,144 @@ func TestResultDelivery_PendingThenAcknowledged_Lifecycle(t *testing.T) {
 	}
 	if got.ResultDeliveryPayload != "" {
 		t.Error("ResultDeliveryPayload should be cleared once acknowledged")
+	}
+}
+
+// TestClaimPendingDeliveries_NotYetDue_NotClaimed guards the backoff gate:
+// a pending delivery whose next_attempt_at is still in the future must not
+// be claimed — retrying before the computed backoff would defeat the point
+// of backing off at all.
+func TestClaimPendingDeliveries_NotYetDue_NotClaimed(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	job, err := store.CreateJob(ctx, sampleRequest("job-not-due"))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	future := time.Now().UTC().Add(time.Hour)
+	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", future); err != nil {
+		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	}
+
+	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPendingDeliveries: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("ClaimPendingDeliveries = %v, want empty (not yet due)", claimed)
+	}
+}
+
+// TestClaimPendingDeliveries_ExpiredClaim_Reclaimed guards the reclaim path:
+// a job stuck at Delivering because a prior claimer crashed before
+// resolving it (never called Acknowledged/Pending/DeadLetter) must become
+// claimable again once its claim TTL has passed — otherwise it would be
+// stuck forever, invisible to both this query and the operator.
+func TestClaimPendingDeliveries_ExpiredClaim_Reclaimed(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	job, err := store.CreateJob(ctx, sampleRequest("job-reclaim"))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	past := time.Now().UTC().Add(-time.Second)
+	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
+		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	}
+
+	// Claim with a TTL so short it's already expired by the time we check again.
+	if _, err := store.ClaimPendingDeliveries(ctx, 10, time.Nanosecond); err != nil {
+		t.Fatalf("first ClaimPendingDeliveries: %v", err)
+	}
+
+	reclaimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("second ClaimPendingDeliveries: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].JobID != job.JobID {
+		t.Fatalf("reclaimed = %v, want exactly [%s]", reclaimed, job.JobID)
+	}
+}
+
+// TestMarkResultDeliveryDeadLetter_PreservesPayloadAndStopsClaiming verifies
+// that a dead-lettered delivery keeps its payload/error for operator
+// inspection (unlike Acknowledged, which clears them) and is never claimed
+// again.
+func TestMarkResultDeliveryDeadLetter_PreservesPayloadAndStopsClaiming(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	job, err := store.CreateJob(ctx, sampleRequest("job-dead-letter"))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	past := time.Now().UTC().Add(-time.Second)
+	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
+		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	}
+	if _, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute); err != nil {
+		t.Fatalf("ClaimPendingDeliveries: %v", err)
+	}
+
+	if err := store.MarkResultDeliveryDeadLetter(ctx, job.JobID, "payload undecodable"); err != nil {
+		t.Fatalf("MarkResultDeliveryDeadLetter: %v", err)
+	}
+
+	got, err := store.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.ResultDeliveryStatus != work.DeliveryDeadLetter {
+		t.Errorf("ResultDeliveryStatus = %q, want dead_letter", got.ResultDeliveryStatus)
+	}
+	if got.ResultDeliveryPayload != `{"kind":"check"}` {
+		t.Errorf("ResultDeliveryPayload = %q, want preserved for operator inspection", got.ResultDeliveryPayload)
+	}
+	if got.ResultDeliveryLastError != "payload undecodable" {
+		t.Errorf("ResultDeliveryLastError = %q, want the dead-letter reason", got.ResultDeliveryLastError)
+	}
+
+	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPendingDeliveries after dead-letter: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("ClaimPendingDeliveries after dead-letter = %v, want empty", claimed)
+	}
+}
+
+// TestClaimPendingDeliveries_RespectsLimitAndOrdering verifies the batch
+// cap and oldest-first ordering — so a long-stuck delivery isn't starved
+// behind a stream of newly-pending ones.
+func TestClaimPendingDeliveries_RespectsLimitAndOrdering(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	var jobIDs []string
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("job-order-%d", i)
+		if _, err := store.CreateJob(ctx, sampleRequest(id)); err != nil {
+			t.Fatalf("CreateJob %s: %v", id, err)
+		}
+		past := time.Now().UTC().Add(-time.Second)
+		if err := store.MarkResultDeliveryPending(ctx, id, `{"kind":"check"}`, "boom", past); err != nil {
+			t.Fatalf("MarkResultDeliveryPending %s: %v", id, err)
+		}
+		jobIDs = append(jobIDs, id)
+	}
+
+	claimed, err := store.ClaimPendingDeliveries(ctx, 2, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPendingDeliveries: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %d, want 2 (limit)", len(claimed))
+	}
+	if claimed[0].JobID != jobIDs[0] || claimed[1].JobID != jobIDs[1] {
+		t.Errorf("claimed order = [%s, %s], want oldest-first [%s, %s]",
+			claimed[0].JobID, claimed[1].JobID, jobIDs[0], jobIDs[1])
 	}
 }
 
