@@ -23,6 +23,12 @@ var trivyVulnReportGVR = schema.GroupVersionResource{
 // and submits a ToolScanRecord to NodeVault. When the CRD is absent or no
 // matching report exists, a "not-available" record is submitted so certification
 // can proceed without being blocked by missing scan infrastructure.
+// L5-b only ever runs when security_scan was requested, and it is always the
+// last stage in the fixed L3->L4->L5A->L5B pipeline order whenever it runs
+// — see process()'s stagePlan — so every record this function submits is
+// Terminal. Both submission points below still go through
+// Worker.claimTerminal so a requeued/retried job can't submit the terminal
+// record twice.
 // Returns a non-nil error when the submission itself fails, so the caller can
 // reflect the failure in the CompleteJob summary.
 func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job) error {
@@ -75,16 +81,17 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		policyResult = "warning"
 	}
 
+	if !w.claimTerminal(ctx, logger, job.JobID) {
+		return nil
+	}
 	req := vaultclient.SubmitScanRecordRequest{
 		ScanID:              scanID,
 		ImageDigest:         job.ImageDigest,
 		ToolName:            job.ToolName,
 		ValidationRequestID: job.ValidationRequestID,
 		SentinelJobID:       job.JobID,
-		// L5-b is always the terminal record in the current fixed pipeline
-		// (nothing runs after it) — see checkRecordSubmission's doc comment
-		// on why this will need to become conditional once requested_actions
-		// actually selects which stages run.
+		// L5-b only runs when requested and is always the last stage in the
+		// fixed pipeline whenever it does — see this file's doc comment.
 		Stage:          vaultclient.StageL5B,
 		Terminal:       true,
 		Scanner:        matched.Scanner,
@@ -108,6 +115,9 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 }
 
 func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.Logger, job *work.Job) error {
+	if !w.claimTerminal(ctx, logger, job.JobID) {
+		return nil
+	}
 	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
 	req := vaultclient.SubmitScanRecordRequest{
 		ScanID:              scanID,

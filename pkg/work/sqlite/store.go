@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   result_delivery_last_error TEXT NOT NULL DEFAULT '',
   next_attempt_at TEXT,
   result_delivery_claimed_until TEXT,
+  terminal_submitted INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -98,6 +99,39 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 	}
 	if err := s.migrateResultDelivery(ctx); err != nil {
 		return fmt.Errorf("migrate result_delivery: %w", err)
+	}
+	if err := s.migrateTerminalSubmitted(ctx); err != nil {
+		return fmt.Errorf("migrate terminal_submitted: %w", err)
+	}
+	return nil
+}
+
+// migrateTerminalSubmitted adds the terminal_submitted column (see
+// work.Job.TerminalSubmitted / Store.ClaimTerminal) to a jobs table created
+// before this migration existed, following the same one-transaction
+// check-then-ALTER pattern as migrateResultDelivery — see its doc comment
+// for why a plain autocommit ALTER would race across connections.
+func (s *Store) migrateTerminalSubmitted(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	has, err := hasColumn(ctx, tx, "jobs", "terminal_submitted")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := tx.ExecContext(
+			ctx, `ALTER TABLE jobs ADD COLUMN terminal_submitted INTEGER NOT NULL DEFAULT 0`,
+		); err != nil {
+			return fmt.Errorf("add terminal_submitted column: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
 	}
 	return nil
 }
@@ -516,7 +550,7 @@ SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_n
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
        status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
        result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error,
-       next_attempt_at
+       next_attempt_at, terminal_submitted
 FROM jobs`
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
@@ -701,6 +735,55 @@ WHERE job_id = ?
 	return out, nil
 }
 
+// ClaimTerminal atomically claims jobID's one-time terminal-submission slot
+// — see work.Store.ClaimTerminal. The UPDATE's WHERE clause only matches a
+// row that is both jobID and not yet claimed, so RowsAffected==1 means this
+// call performed the 0->1 transition (won the claim) and RowsAffected==0
+// means either jobID doesn't exist or it was already claimed; jobExists
+// disambiguates those two so callers can tell "unknown job" (an error) apart
+// from "already claimed" (a normal, no-error, claimed=false outcome).
+func (s *Store) ClaimTerminal(ctx context.Context, jobID string) (bool, error) {
+	now := time.Now().UTC()
+	const q = `
+UPDATE jobs
+SET terminal_submitted = 1, updated_at = ?
+WHERE job_id = ? AND terminal_submitted = 0
+`
+	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
+	if err != nil {
+		return false, fmt.Errorf("claim terminal: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+
+	exists, err := s.jobExists(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, work.ErrNotFound
+	}
+	return false, nil
+}
+
+// jobExists reports whether jobID has a row in the jobs table.
+func (s *Store) jobExists(ctx context.Context, jobID string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM jobs WHERE job_id = ?`, jobID).Scan(&one)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check job exists: %w", err)
+	}
+	return true, nil
+}
+
 type scanner func(dest ...any) error
 
 func scanJob(scan scanner) (*work.Job, error) {
@@ -716,6 +799,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		updatedAt            string
 		resultDeliveryStatus string
 		nextAttemptAt        sql.NullString
+		terminalSubmitted    int
 		job                  work.Job
 	)
 
@@ -744,12 +828,14 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&job.ResultDeliveryAttempts,
 		&job.ResultDeliveryLastError,
 		&nextAttemptAt,
+		&terminalSubmitted,
 	)
 	if err != nil {
 		return nil, err
 	}
 	job.ValidationRequestID = validationRequestID.String
 	job.ResultDeliveryStatus = work.DeliveryStatus(resultDeliveryStatus)
+	job.TerminalSubmitted = terminalSubmitted != 0
 
 	var actions []work.Action
 	if unmarshalErr := json.Unmarshal([]byte(actionsJSON), &actions); unmarshalErr != nil {

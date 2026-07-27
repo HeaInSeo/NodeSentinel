@@ -62,6 +62,10 @@ func (f failingStore) ClaimPendingDeliveries(context.Context, int, time.Duration
 	return nil, errors.New("not implemented")
 }
 
+func (f failingStore) ClaimTerminal(context.Context, string) (bool, error) {
+	return false, errors.New("not implemented")
+}
+
 func (f failingStore) Close() error {
 	return nil
 }

@@ -62,11 +62,18 @@ type PortObservation struct {
 // NodeVault uses this (together with Terminal) to decide whether a record
 // only promotes a ValidationRequestRecord to Running, or closes it out to
 // Succeeded/Failed. In the current worker pipeline (see pkg/worker) stages
-// always run in this fixed order and never skip ahead based on
-// requested_actions yet — L5A is therefore never terminal (L5B always
-// follows it) and L5B always is. Once requested_actions actually selects
-// which stages run (see PR5 in the platform roadmap), Terminal must be
-// computed from that instead of this fixed assumption.
+// always run in this fixed relative order — L3, L4, then (if requested)
+// L5A, then (if requested) L5B — and pkg/worker's process() skips L5A/L5B
+// whose action isn't in job.RequestedActions. Terminal is computed from
+// which stage actually ends up last in that plan (see process()'s
+// isL4Last/isL5ALast and l5b.go's doc comment for L5B, which is always last
+// whenever it runs): a smoke_run-only job gets its Terminal record from L4,
+// a smoke_run+profile job from L5A, and a job that also requests
+// security_scan from L5B — so every successfully completed job produces
+// exactly one Terminal record regardless of which optional stages it asked
+// for. Exactly one, because every Terminal submission first claims the
+// job's one-time terminal-submission slot (see Worker.claimTerminal /
+// Store.ClaimTerminal) — a requeued/retried job can't submit a second one.
 const (
 	StageL3  = "L3"
 	StageL4  = "L4"

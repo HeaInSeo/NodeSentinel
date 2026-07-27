@@ -72,10 +72,17 @@ func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 // runL5a executes L5-a functional validation: creates a K8s Job for the tool
 // image, waits for completion, and submits a ToolCheckRecord to NodeVault.
 // Infra failures (scheduling, timeout, OOM) produce an "infra_failed" record;
-// they are not treated as job failures so L4-successful jobs remain succeeded.
+// they are not treated as job failures so L4-successful jobs remain
+// succeeded — L5-a never calls FailJob or otherwise feeds back into the
+// WorkStore retry loop (see this function's callers in process()). terminal
+// tells this call whether L5-a is the last stage this job's plan runs
+// (security_scan not requested) — see process()'s isL5ALast: when true,
+// L5-a's own record (success or failure) is the job's one Terminal record,
+// since nothing else will run after it; when false, L5-b always follows and
+// owns the Terminal record instead.
 // Returns a non-nil error when the submission itself fails, so the caller can
 // reflect the failure in the CompleteJob summary.
-func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job) error {
+func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job, terminal bool) error {
 	if w.vaultClient == nil {
 		logger.Info("L5-a skipped: no vault client configured")
 		return nil
@@ -93,7 +100,7 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 	if err != nil {
 		logger.Warn("L5-a job creation failed", "err", err)
 		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
-			checkID: checkID, stage: vaultclient.StageL5A, command: command,
+			checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command,
 			validationStatus: "infra_failed", failureKind: vaultclient.FailureKindInfrastructure,
 			failureReason: "infra-level: job creation failed: " + err.Error(), retryable: true,
 		})
@@ -111,14 +118,14 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 	case isInfra && runErr != nil:
 		logger.Warn("L5-a infra-level failure", "err", runErr)
 		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
-			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
 			validationStatus: "infra_failed", failureKind: vaultclient.FailureKindInfrastructure,
 			failureReason: runErr.Error(), retryable: true,
 		})
 	case runErr != nil:
 		logger.Info("L5-a application-level failure", "exit_code", exitCode, "err", runErr)
 		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
-			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
 			validationStatus: "failed", failureKind: vaultclient.FailureKindApplication,
 			failureReason: runErr.Error(), retryable: false,
 		})
@@ -126,7 +133,7 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job)
 		validationHash := computeValidationHash(job.ImageDigest, command, exitCode)
 		logger.Info("L5-a validation succeeded", "validation_hash", validationHash)
 		return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
-			checkID: checkID, stage: vaultclient.StageL5A, command: command, exitCode: exitCode, durationSec: durationSec,
+			checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
 			validationStatus: "succeeded", validationHash: validationHash, allOutputsPresent: true,
 		})
 	}
@@ -201,13 +208,14 @@ func isInfraReason(reason string) bool {
 // Returns the submission error (if any) so the caller can propagate it.
 // checkRecordSubmission holds one call site's worth of "what happened at
 // this stage" — everything submitCheckRecord needs beyond the job itself.
-// Used both by L5-a (stage=L5A, terminal always false — L5-b always
-// follows it in the current fixed pipeline) and by worker.go's L3/L4
-// failure reporting (stage=L3|L4, terminal=true — the pipeline stops
-// there). See vaultclient's Stage/FailureKind consts for the fixed-pipeline
-// caveat: once requested_actions actually selects which stages run,
-// terminal must be computed from that instead of being hardcoded per call
-// site as it is today.
+// Used by L5-a (stage=L5A, terminal only when process()'s isL5ALast says
+// L5-a is the last stage this job's plan runs) and by worker.go's L3/L4
+// terminal reporting (stage=L3|L4, terminal=true on failure always, and on
+// success too when isL4Last — see reportTerminalFailure/reportTerminalSuccess).
+// Terminal is therefore computed by the caller from which stage actually
+// ends up last in the plan, not hardcoded here — see process()'s
+// isL4Last/isL5ALast. submitCheckRecord itself only enforces that whichever
+// caller sets terminal=true goes through the one-per-job claim below.
 type checkRecordSubmission struct {
 	checkID           string
 	stage             string // vaultclient.StageL3 | StageL4 | StageL5A
@@ -224,10 +232,19 @@ type checkRecordSubmission struct {
 }
 
 // submitCheckRecord builds and sends a SubmitCheckRecordRequest to NodeVault.
-// Returns the submission error (if any) so the caller can propagate it.
+// Returns the submission error (if any) so the caller can propagate it. When
+// sub.terminal is set, this first claims job's one-time terminal-submission
+// slot (see Worker.claimTerminal) — a second call for a job whose terminal
+// slot is already claimed is a silent no-op (returns nil without sending
+// anything), so a requeued/retried job can never submit two terminal
+// records for the same validation request.
 func (w *Worker) submitCheckRecord(
 	ctx context.Context, logger *slog.Logger, job *work.Job, sub checkRecordSubmission,
 ) error {
+	if sub.terminal && !w.claimTerminal(ctx, logger, job.JobID) {
+		return nil
+	}
+
 	var contractResult string
 	switch sub.validationStatus {
 	case "succeeded":

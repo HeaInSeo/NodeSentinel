@@ -706,6 +706,49 @@ func TestClaimPendingDeliveries_RespectsLimitAndOrdering(t *testing.T) {
 	}
 }
 
+func TestClaimTerminal_FirstCallClaimsSecondCallDoesNot(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-claim-terminal")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	claimed, err := store.ClaimTerminal(ctx, "job-claim-terminal")
+	if err != nil {
+		t.Fatalf("first ClaimTerminal: %v", err)
+	}
+	if !claimed {
+		t.Error("first ClaimTerminal should return claimed=true")
+	}
+
+	got, err := store.GetJob(ctx, "job-claim-terminal")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if !got.TerminalSubmitted {
+		t.Error("TerminalSubmitted should be true after claiming")
+	}
+
+	claimed, err = store.ClaimTerminal(ctx, "job-claim-terminal")
+	if err != nil {
+		t.Fatalf("second ClaimTerminal should not error, got: %v", err)
+	}
+	if claimed {
+		t.Error("second ClaimTerminal should return claimed=false — the slot is already taken")
+	}
+}
+
+func TestClaimTerminal_UnknownJob_ReturnsErrNotFound(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	_, err := store.ClaimTerminal(ctx, "no-such-job")
+	if !errors.Is(err, work.ErrNotFound) {
+		t.Errorf("ClaimTerminal on unknown job: err = %v, want work.ErrNotFound", err)
+	}
+}
+
 func newStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 

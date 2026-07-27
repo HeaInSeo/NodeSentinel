@@ -88,10 +88,41 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	logger := slog.With("job_id", job.JobID, "image_digest", job.ImageDigest)
 	logger.Info("processing job", "actions", job.RequestedActions)
 
+	plan, err := planStages(job.RequestedActions)
+	if err != nil {
+		// An unrecognized requested_actions value must not be silently
+		// ignored — NodeVault asked for something this worker doesn't know
+		// how to run, and pretending otherwise would either skip a stage
+		// NodeVault expects or run stages that were never asked for. Fail
+		// the job outright (non-retryable — retrying the same
+		// requested_actions can't change the outcome) and still report a
+		// Terminal failure so NodeVault's ValidationRequestRecord doesn't
+		// stay stuck at Queued/Running forever.
+		logger.Error("rejecting job: invalid requested_actions", "err", err)
+		reason := "invalid requested_actions: " + err.Error()
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "validate requested_actions",
+			reason, vaultclient.FailureKindApplication, false)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, reason, false)
+		return
+	}
+
+	// isL4Last/isL5ALast identify which stage is the last one this job's
+	// plan will actually run, so this job's one Terminal record can be
+	// attached to it on success — L5-b (if planned) is always last by
+	// construction and keeps its own always-terminal submission (see
+	// l5b.go); L4 or L5-a instead need to be told explicitly since neither
+	// used to ever submit a Terminal=true record on its own success. See
+	// vaultclient's Stage consts doc comment for the bug this fixes:
+	// NodeVault today only ever requests smoke_run, so before this fix no
+	// Terminal record was ever submitted for a successful smoke_run-only job.
+	isL4Last := !plan.runL5a && !plan.runL5b
+	isL5ALast := plan.runL5a && !plan.runL5b
+
 	jobSpec := buildSmokeJobSpec(job)
 	ns := smokeNamespace
 
-	// L3: dry-run admission check — no actual Job created.
+	// L3: dry-run admission check — no actual Job created. A dry-run failure
+	// is always retryable (admission webhook / API server issue).
 	if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
 		logger.Warn("L3 dry-run failed", "err", err)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run",
@@ -117,17 +148,46 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		return
 	}
 
-	// L5-a and L5-b run after L4 success. They are best-effort: failures are
-	// recorded in NodeVault but do not change the WorkStore job status.
-	l5aErr := w.runL5a(ctx, logger, job)
-	l5bErr := w.runL5b(ctx, logger, job)
-
-	summary := "L3 dry-run passed; L4 smoke-run succeeded; L5 validation submitted"
-	if l5aErr != nil {
-		summary += "; L5-a failed: " + l5aErr.Error()
+	if isL4Last {
+		w.reportTerminalSuccess(ctx, logger, job, vaultclient.StageL4, "smoke-run")
 	}
-	if l5bErr != nil {
+
+	// L5-a and L5-b run after L4 success, gated by the plan resolved from
+	// job.RequestedActions above — NodeVault should only receive check/scan
+	// records for stages it actually requested (see
+	// docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md §4.3). An empty
+	// RequestedActions list is treated as "run everything" for backward
+	// compatibility with callers/rows that predate this gating. They are
+	// best-effort: failures are recorded in NodeVault but do not change the
+	// WorkStore job status.
+	var l5aErr, l5bErr error
+	if plan.runL5a {
+		l5aErr = w.runL5a(ctx, logger, job, isL5ALast)
+	} else {
+		logger.Info("L5-a skipped: profile not in requested_actions")
+	}
+	if plan.runL5b {
+		l5bErr = w.runL5b(ctx, logger, job)
+	} else {
+		logger.Info("L5-b skipped: security_scan not in requested_actions")
+	}
+
+	summary := "L3 dry-run passed; L4 smoke-run succeeded"
+	switch {
+	case l5aErr != nil:
+		summary += "; L5-a failed: " + l5aErr.Error()
+	case plan.runL5a:
+		summary += "; L5-a submitted"
+	default:
+		summary += "; L5-a skipped (not requested)"
+	}
+	switch {
+	case l5bErr != nil:
 		summary += "; L5-b failed: " + l5bErr.Error()
+	case plan.runL5b:
+		summary += "; L5-b submitted"
+	default:
+		summary += "; L5-b skipped (not requested)"
 	}
 	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
@@ -135,12 +195,27 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	logger.Info("job completed", "summary", summary)
 }
 
-// reportTerminalFailure submits a terminal CheckRecord for a validation
-// request that died at stage (L3 or L4), before ever reaching L5. Without
-// this, NodeVault's ValidationRequestRecord for this job would stay stuck
-// at Queued/Running forever: NodeSentinel's own SQLite job state moves to
-// Failed via the caller's FailJob call regardless, but that's local state
-// NodeVault never otherwise sees. Best-effort — a submission failure here
+// reportTerminalFailure submits a CheckRecord for a validation request that
+// died at stage (L3 or L4), before ever reaching L5. The record is always
+// sent — NodeVault must never be left unaware that this stage failed — but
+// its Terminal flag is only set when retryable is false.
+//
+// This distinction matters because a retryable failure also causes the
+// caller to requeue the job via FailJob(..., retryable=true): the job goes
+// back to Queued and will be attempted again by this or another worker.
+// That job has not finished — it may yet succeed (reportTerminalSuccess
+// will then submit the real Terminal record). Submitting Terminal=true here
+// regardless of retryable would both (a) tell NodeVault a request is done
+// when it is only paused for a retry, and (b) permanently claim this job's
+// one-time terminal-submission slot (see claimTerminal/work.Store.ClaimTerminal)
+// — so a later successful retry's reportTerminalSuccess call would find the
+// slot already claimed and silently suppress the real success Terminal
+// record, leaving NodeVault stuck on a stale Failed status forever. See the
+// "retryable Terminal suppression" bug this fixes.
+//
+// A non-retryable failure does mean this validation request is truly done,
+// so Terminal=true is submitted and the terminal slot is claimed via
+// submitCheckRecord/claimTerminal. Best-effort — a submission failure here
 // is only logged; redelivery is handled by the pending-delivery retry in
 // Run's poll loop, not inline here.
 func (w *Worker) reportTerminalFailure(
@@ -157,7 +232,7 @@ func (w *Worker) reportTerminalFailure(
 	sub := checkRecordSubmission{
 		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
 		stage:            stage,
-		terminal:         true,
+		terminal:         !retryable,
 		command:          command,
 		validationStatus: validationStatus,
 		failureKind:      failureKind,
@@ -181,6 +256,57 @@ func stageCheckIDPrefix(stage string) string {
 	default:
 		return "unknown"
 	}
+}
+
+// reportTerminalSuccess submits a terminal CheckRecord marking stage — and
+// therefore this job's whole validation request — as succeeded. Only called
+// when stage is the last one this job's plan runs (see process()'s
+// isL4Last/isL5ALast): a job that goes on to run L5-a/L5-b afterward gets
+// its Terminal record from whichever of those actually ends up last instead.
+// Best-effort like reportTerminalFailure: a submission failure here is only
+// logged and (via submitCheckRecord) queued for redelivery, never surfaced
+// as a WorkStore job failure.
+func (w *Worker) reportTerminalSuccess(ctx context.Context, logger *slog.Logger, job *work.Job, stage, command string) {
+	if w.vaultClient == nil {
+		return
+	}
+	sub := checkRecordSubmission{
+		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
+		stage:            stage,
+		terminal:         true,
+		command:          command,
+		validationStatus: "succeeded",
+	}
+	if err := w.submitCheckRecord(ctx, logger, job, sub); err != nil {
+		logger.Error("failed to report pipeline success to NodeVault", "stage", stage, "err", err)
+	}
+}
+
+// claimTerminal attempts to claim job's one-time terminal-submission slot
+// (see work.Store.ClaimTerminal) and reports whether the caller should
+// proceed to actually submit the terminal record. Two outcomes prevent
+// submission: the slot was already claimed by an earlier call for the same
+// job (a requeued/retried job re-reaching this decision point, or any other
+// duplicate invocation) — logged at Info and reported as false, no error;
+// storage-layer errors are logged at Warn but reported as true (fail open)
+// rather than silently dropping what may be this job's only terminal
+// record — an occasional duplicate delivery is the safer failure mode,
+// since NodeVault's own conflict handling (see vaultclient.SubmitError's 409
+// case) is the backstop for that, whereas a job that never reports any
+// terminal record leaves its ValidationRequestRecord stuck forever.
+func (w *Worker) claimTerminal(ctx context.Context, logger *slog.Logger, jobID string) bool {
+	claimed, err := w.store.ClaimTerminal(ctx, jobID)
+	if err != nil {
+		logger.Warn("claim terminal submission slot failed — proceeding without idempotency guard",
+			"job_id", jobID, "err", err)
+		return true
+	}
+	if !claimed {
+		logger.Info("terminal record already submitted for this job — skipping duplicate submission",
+			"job_id", jobID)
+		return false
+	}
+	return true
 }
 
 func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job) error {
@@ -232,6 +358,47 @@ func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string
 			}
 		}
 	}
+}
+
+// stagePlan is the set of optional L5 stages a job's requested_actions
+// selects — see planStages. smoke_run (L3 dry-run + L4 smoke-run) is always
+// part of the pipeline, so it has no field here; it's simply never
+// conditional.
+type stagePlan struct {
+	runL5a bool
+	runL5b bool
+}
+
+// planStages validates job.RequestedActions and resolves which optional L5
+// stages this job's pipeline run will execute. An empty RequestedActions
+// list means the caller didn't select specific stages — treated as "run
+// everything" so old NodeVault versions that don't populate
+// requested_actions at all (or pre-existing stored rows from before this
+// field was required non-empty) keep today's unconditional-execution
+// behavior instead of silently running nothing.
+//
+// Any action value other than smoke_run/profile/security_scan is rejected
+// with an error rather than silently ignored: a typo'd or future-NodeVault
+// action must not quietly degrade into "not requested", since that could
+// skip a stage NodeVault's caller actually expects to run.
+func planStages(requested []work.Action) (stagePlan, error) {
+	if len(requested) == 0 {
+		return stagePlan{runL5a: true, runL5b: true}, nil
+	}
+	var plan stagePlan
+	for _, a := range requested {
+		switch a {
+		case work.ActionSmokeRun:
+			// Always part of the pipeline — nothing to record.
+		case work.ActionProfile:
+			plan.runL5a = true
+		case work.ActionSecurityScan:
+			plan.runL5b = true
+		default:
+			return stagePlan{}, fmt.Errorf("unknown requested action %q", a)
+		}
+	}
+	return plan, nil
 }
 
 func (w *Worker) deleteJob(ctx context.Context, ns, name string) error {

@@ -127,6 +127,16 @@ type Job struct {
 	// NextAttemptAt gates redelivery eligibility (exponential backoff+jitter
 	// — see pkg/worker/delivery.go). Nil until the first pending mark.
 	NextAttemptAt *time.Time
+
+	// TerminalSubmitted records whether this job has already claimed
+	// responsibility for submitting its one terminal validation-result
+	// record (see Store.ClaimTerminal). It is separate from
+	// ResultDeliveryStatus, which only tracks *redelivery* of a record whose
+	// first submission attempt failed — TerminalSubmitted guards against
+	// *initiating* a second terminal submission in the first place (e.g. a
+	// requeued/retried job re-reaching the point where it would otherwise
+	// submit another terminal record).
+	TerminalSubmitted bool
 }
 
 type Store interface {
@@ -164,6 +174,15 @@ type Store interface {
 	// therefore never claim the same job — see pkg/work/sqlite's
 	// _txlock=immediate DSN option. Returns oldest-updated first.
 	ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL time.Duration) ([]*Job, error)
+
+	// ClaimTerminal atomically claims jobID's one-time terminal-submission
+	// slot: the first caller for a given job gets claimed=true and is the
+	// one responsible for actually submitting that job's one terminal
+	// validation-result record; every subsequent caller (a duplicate
+	// invocation, a requeued job re-reaching the same terminal decision
+	// point) gets claimed=false and must not submit again. Returns
+	// ErrNotFound if jobID does not exist.
+	ClaimTerminal(ctx context.Context, jobID string) (claimed bool, err error)
 
 	Close() error
 }

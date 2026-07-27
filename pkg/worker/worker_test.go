@@ -33,32 +33,42 @@ func newTestStore(t *testing.T) work.Store {
 	return s
 }
 
+// newTestJob returns a JobRequest requesting the full pipeline (smoke_run +
+// profile + security_scan) so tests built against this shared fixture keep
+// exercising L5-a/L5-b the way they did before requested_actions gated
+// execution in process() — see TestProcess_SmokeRunOnly_* in process_test.go
+// for the dedicated partial-selection regression coverage.
 func newTestJob() work.JobRequest {
 	return work.JobRequest{
-		ArtifactKind:     "tool",
-		ImageRepository:  "harbor.example.com/library/bwa",
-		ImageDigest:      "sha256:abc123",
-		StableRef:        "bwa@0.7.17",
-		ToolName:         "bwa",
-		Version:          "0.7.17",
-		CasHash:          "deadbeef",
-		RequestedActions: []work.Action{work.ActionSmokeRun},
+		ArtifactKind:    "tool",
+		ImageRepository: "harbor.example.com/library/bwa",
+		ImageDigest:     "sha256:abc123",
+		StableRef:       "bwa@0.7.17",
+		ToolName:        "bwa",
+		Version:         "0.7.17",
+		CasHash:         "deadbeef",
+		RequestedActions: []work.Action{
+			work.ActionSmokeRun, work.ActionProfile, work.ActionSecurityScan,
+		},
 	}
 }
 
 // makeTestWorkJob returns a *work.Job suitable for unit tests that need a
-// fully-populated job without going through the store.
+// fully-populated job without going through the store. Requests the full
+// pipeline — see newTestJob's doc comment.
 func makeTestWorkJob() *work.Job {
 	return &work.Job{
-		JobID:            "test-job-abc123",
-		ArtifactKind:     "tool",
-		ImageRepository:  "harbor.example.com/library/bwa",
-		ImageDigest:      "sha256:abc123",
-		StableRef:        "bwa@0.7.17",
-		ToolName:         "bwa",
-		Version:          "0.7.17",
-		CasHash:          "deadbeef",
-		RequestedActions: []work.Action{work.ActionSmokeRun},
+		JobID:           "test-job-abc123",
+		ArtifactKind:    "tool",
+		ImageRepository: "harbor.example.com/library/bwa",
+		ImageDigest:     "sha256:abc123",
+		StableRef:       "bwa@0.7.17",
+		ToolName:        "bwa",
+		Version:         "0.7.17",
+		CasHash:         "deadbeef",
+		RequestedActions: []work.Action{
+			work.ActionSmokeRun, work.ActionProfile, work.ActionSecurityScan,
+		},
 	}
 }
 
@@ -295,7 +305,7 @@ func TestRunL5a_Error_ReflectedInSummary_Regression(t *testing.T) {
 	logger := slog.Default()
 
 	// runL5a must return a non-nil error when the vault submit fails.
-	err := w.runL5a(context.Background(), logger, job)
+	err := w.runL5a(context.Background(), logger, job, false)
 	if err == nil {
 		t.Fatal("expected runL5a to return error when vault is unreachable, got nil")
 	}

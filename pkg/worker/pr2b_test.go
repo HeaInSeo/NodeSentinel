@@ -102,8 +102,17 @@ func TestReportTerminalFailure_InfrastructureAndApplication(t *testing.T) {
 			if got.Stage != tt.stage {
 				t.Errorf("Stage = %q, want %q", got.Stage, tt.stage)
 			}
-			if !got.Terminal {
-				t.Error("Terminal = false, want true (L3/L4 failures always end the request)")
+			// A retryable failure is only a pause, not the end of the
+			// request — the job is requeued (see FailJob(..., retryable))
+			// and may yet succeed, at which point reportTerminalSuccess must
+			// still be able to submit the real Terminal record. So Terminal
+			// is only true when this failure is NOT retryable. See
+			// reportTerminalFailure's doc comment for the bug this guards
+			// against (a retryable failure permanently claiming the
+			// terminal-submission slot and suppressing a later success).
+			wantTerminal := !tt.retryable
+			if got.Terminal != wantTerminal {
+				t.Errorf("Terminal = %v, want %v (retryable=%v)", got.Terminal, wantTerminal, tt.retryable)
 			}
 			if got.FailureKind != tt.wantFailureKind {
 				t.Errorf("FailureKind = %q, want %q", got.FailureKind, tt.wantFailureKind)
@@ -127,6 +136,13 @@ func TestReportTerminalFailure_InfrastructureAndApplication(t *testing.T) {
 // TestProcess_L3DryRunFails_SubmitsTerminalCheckRecordToNodeVault is the
 // end-to-end guard: before PR2-B, an L3 rejection never reached NodeVault at
 // all, so its ValidationRequestRecord would stay stuck at Queued forever.
+// L3 failures are always retryable (see process()), so the record this test
+// asserts on is non-terminal (Terminal=false): it still tells NodeVault the
+// request is progressing (promoting Queued->Running per
+// SubmitCheckRecordRequest.Terminal's doc comment) without prematurely
+// closing out a request that will be retried — see
+// reportTerminalFailure's doc comment for why a retryable failure must not
+// claim the one-time terminal-submission slot.
 func TestProcess_L3DryRunFails_SubmitsTerminalCheckRecordToNodeVault(t *testing.T) {
 	var captured []capturedSubmission
 	vc := capturingVaultServer(t, &captured)
@@ -161,17 +177,34 @@ func TestProcess_L3DryRunFails_SubmitsTerminalCheckRecordToNodeVault(t *testing.
 	if got.Stage != vaultclient.StageL3 {
 		t.Errorf("Stage = %q, want L3", got.Stage)
 	}
-	if !got.Terminal {
-		t.Error("Terminal = false, want true")
+	if got.Terminal {
+		t.Error("Terminal = true, want false — L3 failures are always retryable, so this record must not " +
+			"close out the ValidationRequestRecord (the job is requeued and may yet succeed)")
 	}
 	if got.ValidationRequestID != created.ValidationRequestID {
 		t.Errorf("ValidationRequestID = %q, want %q", got.ValidationRequestID, created.ValidationRequestID)
 	}
+
+	stored, err := store.GetJob(context.Background(), created.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.TerminalSubmitted {
+		t.Error("TerminalSubmitted = true, want false — a retryable failure must not claim the " +
+			"terminal-submission slot (see reportTerminalFailure's doc comment)")
+	}
+	if stored.Status != work.StatusQueued {
+		t.Errorf("Status = %q, want queued (retryable L3 failure requeues the job)", stored.Status)
+	}
 }
 
-// ── L5-a is never terminal (L5-b always follows it) ─────────────────────────
+// ── L5-a's Terminal flag is caller-supplied (true only when it's the last
+// planned stage — see process()'s isL5ALast) ────────────────────────────────
 
-func TestRunL5a_Success_NeverTerminal(t *testing.T) {
+// TestRunL5a_Success_NotTerminal_WhenL5bAlsoPlanned verifies that runL5a
+// respects a terminal=false argument (the case where L5-b also runs
+// afterward and owns the Terminal record instead).
+func TestRunL5a_Success_NotTerminal_WhenL5bAlsoPlanned(t *testing.T) {
 	useFastWorkerTicks(t)
 
 	var captured []capturedSubmission
@@ -187,7 +220,7 @@ func TestRunL5a_Success_NeverTerminal(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 
-	if err := w.runL5a(context.Background(), slog.Default(), job); err != nil {
+	if err := w.runL5a(context.Background(), slog.Default(), job, false); err != nil {
 		t.Fatalf("runL5a: %v", err)
 	}
 	if len(captured) != 1 {
@@ -198,7 +231,42 @@ func TestRunL5a_Success_NeverTerminal(t *testing.T) {
 		t.Errorf("Stage = %q, want L5A", got.Stage)
 	}
 	if got.Terminal {
-		t.Error("Terminal = true, want false — L5-b always runs after L5-a in the current fixed pipeline")
+		t.Error("Terminal = true, want false — terminal=false was passed in (L5-b still runs after L5-a)")
+	}
+}
+
+// TestRunL5a_Success_Terminal_WhenL5aIsLastStage verifies that runL5a honors
+// terminal=true (the case where profile was requested but security_scan was
+// not, so L5-a is the last stage the plan runs — see process()'s
+// isL5ALast).
+func TestRunL5a_Success_Terminal_WhenL5aIsLastStage(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	var captured []capturedSubmission
+	vc := capturingVaultServer(t, &captured)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	kube.PrependReactor("get", "jobs", alwaysCompleteReactor(smokeNamespace))
+	w := New(store, kube, "test-worker").WithVaultClient(vc)
+
+	job, err := store.CreateJob(context.Background(), newTestJob())
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	if err := w.runL5a(context.Background(), slog.Default(), job, true); err != nil {
+		t.Fatalf("runL5a: %v", err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("submissions captured = %d, want 1", len(captured))
+	}
+	got := captured[0].decodeCheck(t)
+	if got.Stage != vaultclient.StageL5A {
+		t.Errorf("Stage = %q, want L5A", got.Stage)
+	}
+	if !got.Terminal {
+		t.Error("Terminal = false, want true — terminal=true was passed in (L5-a is the last planned stage)")
 	}
 }
 
