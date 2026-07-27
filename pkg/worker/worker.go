@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/HeaInSeo/NodeSentinel/pkg/metrics"
 	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
@@ -26,6 +27,7 @@ type Worker struct {
 	workerName  string
 	vaultClient *vaultclient.Client // nil → L5 steps skipped
 	dynamicKube dynamic.Interface   // nil → L5-b submits not-available record
+	metrics     *metrics.Metrics    // nil → metrics recording is a no-op (e.g. in unit tests)
 }
 
 var (
@@ -45,6 +47,15 @@ func (w *Worker) WithVaultClient(c *vaultclient.Client) *Worker {
 // New creates a Worker. workerName identifies this instance in LeaseJob records.
 func New(store work.Store, kube kubernetes.Interface, workerName string) *Worker {
 	return &Worker{store: store, kube: kube, workerName: workerName}
+}
+
+// WithMetrics sets the Metrics instance the worker records pipeline counters
+// to. Optional — a nil (default, unset) Metrics leaves recording a no-op, so
+// existing tests that construct a Worker via New() without this need no
+// changes. Returns w for chaining.
+func (w *Worker) WithMetrics(m *metrics.Metrics) *Worker {
+	w.metrics = m
+	return w
 }
 
 // Run polls for queued jobs and processes them. It blocks until ctx is
@@ -80,6 +91,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		w.incJobsLeased()
 		w.process(ctx, job)
 	}
 }
@@ -103,6 +115,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "validate requested_actions",
 			reason, vaultclient.FailureKindApplication, false)
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, reason, false)
+		w.incJobsFailed()
 		return
 	}
 
@@ -128,6 +141,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run",
 			err.Error(), vaultclient.FailureKindInfrastructure, true)
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, "L3 dry-run: "+err.Error(), true)
+		w.incJobsFailed()
 		return
 	}
 	logger.Info("L3 dry-run passed")
@@ -145,6 +159,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "smoke-run",
 			result.reason, failureKind, result.retryable)
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, result.reason, result.retryable)
+		w.incJobsFailed()
 		return
 	}
 
@@ -163,11 +178,21 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	var l5aErr, l5bErr error
 	if plan.runL5a {
 		l5aErr = w.runL5a(ctx, logger, job, isL5ALast)
+		if l5aErr != nil {
+			w.incL5aErrors()
+		} else {
+			w.incL5aSubmitted()
+		}
 	} else {
 		logger.Info("L5-a skipped: profile not in requested_actions")
 	}
 	if plan.runL5b {
 		l5bErr = w.runL5b(ctx, logger, job)
+		if l5bErr != nil {
+			w.incL5bErrors()
+		} else {
+			w.incL5bSubmitted()
+		}
 	} else {
 		logger.Info("L5-b skipped: security_scan not in requested_actions")
 	}
@@ -192,6 +217,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
 	}
+	w.incJobsCompleted()
 	logger.Info("job completed", "summary", summary)
 }
 
@@ -399,6 +425,51 @@ func planStages(requested []work.Action) (stagePlan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// The incXxx wrappers below record pipeline counters when w.metrics is
+// configured (see WithMetrics) and are no-ops otherwise, so unit tests that
+// construct a Worker via New() without metrics don't need any changes.
+func (w *Worker) incJobsLeased() {
+	if w.metrics != nil {
+		w.metrics.IncJobsLeased()
+	}
+}
+
+func (w *Worker) incJobsCompleted() {
+	if w.metrics != nil {
+		w.metrics.IncJobsCompleted()
+	}
+}
+
+func (w *Worker) incJobsFailed() {
+	if w.metrics != nil {
+		w.metrics.IncJobsFailed()
+	}
+}
+
+func (w *Worker) incL5aSubmitted() {
+	if w.metrics != nil {
+		w.metrics.IncL5aSubmitted()
+	}
+}
+
+func (w *Worker) incL5aErrors() {
+	if w.metrics != nil {
+		w.metrics.IncL5aErrors()
+	}
+}
+
+func (w *Worker) incL5bSubmitted() {
+	if w.metrics != nil {
+		w.metrics.IncL5bSubmitted()
+	}
+}
+
+func (w *Worker) incL5bErrors() {
+	if w.metrics != nil {
+		w.metrics.IncL5bErrors()
+	}
 }
 
 func (w *Worker) deleteJob(ctx context.Context, ns, name string) error {

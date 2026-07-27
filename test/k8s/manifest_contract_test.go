@@ -189,6 +189,7 @@ func TestNodeSentinelDeploymentContract(t *testing.T) {
 	env := nestedSlice(t, container, "env")
 	requiredEnv := map[string]string{
 		"NODESENTINEL_GRPC_PORT": "50052",
+		"NODESENTINEL_HTTP_PORT": "8080",
 		"NODEVAULT_API_ADDR":     "http://nodevault-controlplane.nodevault-system.svc:8082",
 		"SMOKE_NAMESPACE":        "nodevault-smoke",
 	}
@@ -206,16 +207,42 @@ func TestNodeSentinelDeploymentContract(t *testing.T) {
 		t.Fatalf("missing env vars: %v", requiredEnv)
 	}
 
+	// issue #6: liveness/readiness probes must exist, matching the httpGet
+	// /healthz + /readyz pattern used by JUMI's and artifact-handoff's
+	// manifests, so K8s can detect and restart a stuck/crashed pod and stop
+	// routing traffic to a not-yet-ready one.
+	if got := nestedString(t, container, "readinessProbe", "httpGet", "path"); got != "/readyz" {
+		t.Fatalf("readinessProbe.httpGet.path = %q, want /readyz", got)
+	}
+	if got := nestedString(t, container, "readinessProbe", "httpGet", "port"); got != "http" {
+		t.Fatalf("readinessProbe.httpGet.port = %q, want http", got)
+	}
+	if got := nestedString(t, container, "livenessProbe", "httpGet", "path"); got != "/healthz" {
+		t.Fatalf("livenessProbe.httpGet.path = %q, want /healthz", got)
+	}
+	if got := nestedString(t, container, "livenessProbe", "httpGet", "port"); got != "http" {
+		t.Fatalf("livenessProbe.httpGet.port = %q, want http", got)
+	}
+
 	if service.GetNamespace() != "nodesentinel-system" {
 		t.Fatalf("service namespace = %q, want nodesentinel-system", service.GetNamespace())
 	}
 	ports := nestedSlice(t, service.Object, "spec", "ports")
-	if len(ports) != 1 {
-		t.Fatalf("service ports = %d, want 1", len(ports))
+	if len(ports) != 2 {
+		t.Fatalf("service ports = %d, want 2 (grpc, http)", len(ports))
 	}
-	port := objectMap(t, ports[0])
-	if got := nestedString(t, port, "targetPort"); got != "grpc" {
-		t.Fatalf("service targetPort = %q, want grpc", got)
+	wantTargetPorts := map[string]bool{"grpc": false, "http": false}
+	for _, rawPort := range ports {
+		port := objectMap(t, rawPort)
+		targetPort := nestedString(t, port, "targetPort")
+		if _, ok := wantTargetPorts[targetPort]; ok {
+			wantTargetPorts[targetPort] = true
+		}
+	}
+	for targetPort, found := range wantTargetPorts {
+		if !found {
+			t.Fatalf("service missing port with targetPort %q", targetPort)
+		}
 	}
 }
 

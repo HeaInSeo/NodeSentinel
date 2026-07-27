@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/ingress"
+	"github.com/HeaInSeo/NodeSentinel/pkg/metrics"
 	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
 	"github.com/HeaInSeo/NodeSentinel/pkg/worker"
@@ -36,6 +39,19 @@ func main() {
 		os.Exit(1)
 	}
 	listenAddr := net.JoinHostPort("", strconv.Itoa(port))
+
+	httpPortNum, err := httpPort()
+	if err != nil {
+		slog.Error("invalid HTTP port", "err", err)
+		os.Exit(1)
+	}
+	httpListenAddr := net.JoinHostPort("", strconv.Itoa(httpPortNum))
+
+	m, err := metrics.New()
+	if err != nil {
+		slog.Error("initialize metrics", "err", err)
+		os.Exit(1)
+	}
 
 	store, err := sqlite.New(dbPath)
 	if err != nil {
@@ -82,7 +98,8 @@ func main() {
 		}
 		w := worker.New(store, kube, "nodesentinel-worker-0").
 			WithVaultClient(vaultclient.New()).
-			WithDynamicKubeClient(dynKube)
+			WithDynamicKubeClient(dynKube).
+			WithMetrics(m)
 
 		g.Go(func() error {
 			slog.Info("worker started (L3/L4/L5)")
@@ -111,16 +128,70 @@ func main() {
 		return nil
 	})
 
+	// /healthz, /readyz, /metrics — see docs on newHTTPServer for what each
+	// reports. Supervised the same way as the gRPC server: GracefulStop-style
+	// shutdown on gCtx cancellation, and a non-nil Serve error propagates via
+	// g.Wait() like any other loop.
+	httpServer := newHTTPServer(m, httpListenAddr)
+	g.Go(func() error {
+		<-gCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	})
+	g.Go(func() error {
+		slog.Info("NodeSentinel HTTP (healthz/readyz/metrics) listening", "port", httpPortNum)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve http: %w", err)
+		}
+		return nil
+	})
+
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("nodesentinel exited with error", "err", err)
 		os.Exit(1)
 	}
 }
 
+// newHTTPServer builds the /healthz, /readyz, /metrics HTTP server, mirroring
+// the pattern used by JUMI and artifact-handoff (see their pkg/metrics and
+// cmd/*/main.go): /healthz and /readyz both simply report the process is up
+// — NodeSentinel has no external dependency cheap enough to probe per
+// request without its own design work, so a deeper readiness check (e.g.
+// WorkStore connectivity) is left as a follow-up, not this change's scope.
+func newHTTPServer(m *metrics.Metrics, listenAddr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+	mux.Handle("/metrics", m.Handler())
+	return &http.Server{
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
 func grpcPort() (int, error) {
-	value := os.Getenv("NODESENTINEL_GRPC_PORT")
+	return parsePort("NODESENTINEL_GRPC_PORT", 50052)
+}
+
+// httpPort returns the port for the /healthz, /readyz, /metrics HTTP server
+// (NODESENTINEL_HTTP_PORT, default 8080 — matching JUMI's/artifact-handoff's
+// convention for their HTTP port).
+func httpPort() (int, error) {
+	return parsePort("NODESENTINEL_HTTP_PORT", 8080)
+}
+
+func parsePort(envKey string, fallback int) (int, error) {
+	value := os.Getenv(envKey)
 	if value == "" {
-		value = "50052"
+		value = strconv.Itoa(fallback)
 	}
 	port, err := strconv.Atoi(value)
 	if err != nil {

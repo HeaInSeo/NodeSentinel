@@ -31,9 +31,14 @@ spec:
             - name: grpc
               containerPort: 50052
               protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
           env:
             - name: NODESENTINEL_GRPC_PORT
               value: "50052"
+            - name: NODESENTINEL_HTTP_PORT
+              value: "8080"
             - name: NODESENTINEL_DB_PATH
               value: /var/lib/nodesentinel/nodesentinel.db
             - name: NODEVAULT_API_ADDR
@@ -50,6 +55,14 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -74,4 +87,8 @@ spec:
     - name: grpc
       port: 50052
       targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: 8080
+      targetPort: http
       protocol: TCP
