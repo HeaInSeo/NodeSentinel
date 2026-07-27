@@ -67,13 +67,14 @@ func TestReportTerminalFailure_InfrastructureAndApplication(t *testing.T) {
 	tests := []struct {
 		name                 string
 		stage                string
+		class                FailureClass
 		retryable            bool
 		wantFailureKind      string
 		wantValidationStatus string
 	}{
-		{"L3 is always infrastructure", vaultclient.StageL3, true, vaultclient.FailureKindInfrastructure, "infra_failed"},
-		{"L4 infra-level (retryable)", vaultclient.StageL4, true, vaultclient.FailureKindInfrastructure, "infra_failed"},
-		{"L4 application-level (not retryable)", vaultclient.StageL4, false, vaultclient.FailureKindApplication, "failed"},
+		{"L3 is always infrastructure", vaultclient.StageL3, FailureClassTransientInfra, true, vaultclient.FailureKindInfrastructure, "infra_failed"},
+		{"L4 infra-level (retryable)", vaultclient.StageL4, FailureClassTransientInfra, true, vaultclient.FailureKindInfrastructure, "infra_failed"},
+		{"L4 application-level (not retryable)", vaultclient.StageL4, FailureClassDeterministic, false, vaultclient.FailureKindApplication, "failed"},
 	}
 
 	for _, tt := range tests {
@@ -89,11 +90,8 @@ func TestReportTerminalFailure_InfrastructureAndApplication(t *testing.T) {
 				t.Fatalf("CreateJob: %v", err)
 			}
 
-			failureKind := vaultclient.FailureKindInfrastructure
-			if !tt.retryable {
-				failureKind = vaultclient.FailureKindApplication
-			}
-			w.reportTerminalFailure(context.Background(), slog.Default(), job, tt.stage, "cmd", "boom", failureKind, tt.retryable)
+			decision := RetryDecision{Class: tt.class, Retry: tt.retryable, Reason: "boom"}
+			w.reportTerminalFailure(context.Background(), slog.Default(), job, tt.stage, "cmd", decision)
 
 			if len(captured) != 1 {
 				t.Fatalf("captured submissions = %d, want 1", len(captured))

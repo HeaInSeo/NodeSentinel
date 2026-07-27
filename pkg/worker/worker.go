@@ -111,10 +111,10 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		// Terminal failure so NodeVault's ValidationRequestRecord doesn't
 		// stay stuck at Queued/Running forever.
 		logger.Error("rejecting job: invalid requested_actions", "err", err)
-		reason := "invalid requested_actions: " + err.Error()
-		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "validate requested_actions",
-			reason, vaultclient.FailureKindApplication, false)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, reason, false)
+		decision := decideRetry(FailureClassDeterministic, job, "invalid requested_actions: "+err.Error())
+		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "validate requested_actions", decision)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
 		w.incJobsFailed()
 		return
 	}
@@ -135,12 +135,15 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	ns := smokeNamespace
 
 	// L3: dry-run admission check — no actual Job created. A dry-run failure
-	// is always retryable (admission webhook / API server issue).
+	// is always classified TransientInfra (admission webhook / API server
+	// issue) — see decideRetry for how repeated failures are eventually
+	// bounded by maxAttempts instead of retrying forever.
 	if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
 		logger.Warn("L3 dry-run failed", "err", err)
-		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run",
-			err.Error(), vaultclient.FailureKindInfrastructure, true)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, "L3 dry-run: "+err.Error(), true)
+		decision := decideRetry(FailureClassTransientInfra, job, "L3 dry-run: "+err.Error())
+		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run", decision)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
 		w.incJobsFailed()
 		return
 	}
@@ -152,13 +155,10 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 
 	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec)
 	if !result.success {
-		failureKind := vaultclient.FailureKindInfrastructure
-		if !result.retryable {
-			failureKind = vaultclient.FailureKindApplication
-		}
-		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "smoke-run",
-			result.reason, failureKind, result.retryable)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, result.reason, result.retryable)
+		decision := decideRetry(result.class, job, result.reason)
+		w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "smoke-run", decision)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
 		w.incJobsFailed()
 		return
 	}
@@ -224,49 +224,77 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 // reportTerminalFailure submits a CheckRecord for a validation request that
 // died at stage (L3 or L4), before ever reaching L5. The record is always
 // sent — NodeVault must never be left unaware that this stage failed — but
-// its Terminal flag is only set when retryable is false.
+// its Terminal flag is only set when decision.Retry is false.
 //
-// This distinction matters because a retryable failure also causes the
-// caller to requeue the job via FailJob(..., retryable=true): the job goes
-// back to Queued and will be attempted again by this or another worker.
-// That job has not finished — it may yet succeed (reportTerminalSuccess
-// will then submit the real Terminal record). Submitting Terminal=true here
-// regardless of retryable would both (a) tell NodeVault a request is done
-// when it is only paused for a retry, and (b) permanently claim this job's
-// one-time terminal-submission slot (see claimTerminal/work.Store.ClaimTerminal)
-// — so a later successful retry's reportTerminalSuccess call would find the
-// slot already claimed and silently suppress the real success Terminal
-// record, leaving NodeVault stuck on a stale Failed status forever. See the
+// This distinction matters because a retryable decision (e.g. L3's admission
+// dry-run, or an L4 TRANSIENT_INFRA/UNKNOWN classification still within its
+// retry budget) also causes the caller to requeue the job via
+// FailJob(..., retryable=true): the job goes back to Queued and will be
+// attempted again by this or another worker. That job has not finished — it
+// may yet succeed (reportTerminalSuccess will then submit the real Terminal
+// record) or eventually fail non-retryably (either its own classification
+// says so, or it exhausts maxAttempts — see decideRetry's RETRY_EXHAUSTED/
+// UNKNOWN_RETRY_LIMIT reasons). Submitting Terminal=true here regardless of
+// decision.Retry would both (a) tell NodeVault a request is done when it is
+// only paused for a retry, and (b) permanently claim this job's one-time
+// terminal-submission slot (see claimTerminal/work.Store.ClaimTerminal) — so
+// a later successful retry's reportTerminalSuccess call would find the slot
+// already claimed and silently suppress the real success Terminal record,
+// leaving NodeVault stuck on a stale Failed status forever. See the
 // "retryable Terminal suppression" bug this fixes.
 //
-// A non-retryable failure does mean this validation request is truly done,
-// so Terminal=true is submitted and the terminal slot is claimed via
-// submitCheckRecord/claimTerminal. Best-effort — a submission failure here
-// is only logged; redelivery is handled by the pending-delivery retry in
-// Run's poll loop, not inline here.
+// A non-retryable decision (DETERMINISTIC, RESOURCE_OBSERVATION, or any
+// class that has exhausted its retry budget) does mean this validation
+// request is truly done, so Terminal=true is submitted and the terminal
+// slot is claimed via submitCheckRecord/claimTerminal — exactly like before
+// this fix. Best-effort — a submission failure here is only logged;
+// redelivery is handled by the pending-delivery retry in Run's poll loop,
+// not inline here.
+//
+// The wire ValidationStatus/FailureKind come from decision.Class.wireStatus()
+// — see that method's doc comment for why FailureClass itself (e.g. the
+// literal string "RESOURCE_OBSERVATION") is never sent to NodeVault, only
+// mapped onto the existing CheckRecord fields. Retryable on the wire is
+// decision.Retry (the actual decision, which folds in maxAttempts/UNKNOWN's
+// one-retry limit), not the class's "would this kind of failure ever be
+// retried in principle" default.
 func (w *Worker) reportTerminalFailure(
 	ctx context.Context, logger *slog.Logger, job *work.Job,
-	stage, command, failureReason, failureKind string, retryable bool,
+	stage, command string, decision RetryDecision,
 ) {
 	if w.vaultClient == nil {
 		return
 	}
-	validationStatus := "infra_failed"
-	if failureKind == vaultclient.FailureKindApplication {
-		validationStatus = "failed"
-	}
+	validationStatus, failureKind := decision.Class.wireStatus()
 	sub := checkRecordSubmission{
 		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
 		stage:            stage,
-		terminal:         !retryable,
+		terminal:         !decision.Retry,
 		command:          command,
 		validationStatus: validationStatus,
 		failureKind:      failureKind,
-		failureReason:    failureReason,
-		retryable:        retryable,
+		failureReason:    decision.Reason,
+		retryable:        decision.Retry,
 	}
 	if err := w.submitCheckRecord(ctx, logger, job, sub); err != nil {
 		logger.Error("failed to report pipeline failure to NodeVault", "stage", stage, "err", err)
+	}
+}
+
+// noteClassification records the FailureClass a stage's failure was
+// classified as: always via the low-cardinality nodesentinel_failures_classified
+// metric (class/stage only — see Metrics.IncFailureClassified's doc comment
+// for why the raw reason never becomes a label), and additionally via a
+// structured slog.Warn carrying the *full* raw reason when class is
+// FailureClassUnknown — an unrecognized signal is exactly the case an
+// operator most needs the complete detail for, since no known pattern
+// explains it. Called from every L3/L4/L5-a classification site right after
+// decideRetry.
+func (w *Worker) noteClassification(logger *slog.Logger, stage string, class FailureClass, rawReason string) {
+	w.incFailureClassified(class, stage)
+	if class == FailureClassUnknown {
+		logger.Warn("failure classified as UNKNOWN — full raw signal logged for investigation",
+			"stage", stage, "raw_reason", rawReason)
 	}
 }
 
@@ -346,7 +374,8 @@ func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job)
 func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job) outcome {
 	created, err := w.kube.BatchV1().Jobs(ns).Create(ctx, jobSpec, metav1.CreateOptions{})
 	if err != nil {
-		return outcome{success: false, retryable: true, reason: "failed to create smoke-run Job: " + err.Error()}
+		return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+			reason: "failed to create smoke-run Job: " + err.Error()}
 	}
 	logger.Info("L4 smoke-run Job created", "k8s_job", created.Name)
 
@@ -369,7 +398,8 @@ func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string
 		case <-pollTick.C:
 			k8sJob, err := w.kube.BatchV1().Jobs(ns).Get(ctx, created.Name, metav1.GetOptions{})
 			if err != nil {
-				return outcome{success: false, retryable: true, reason: "get smoke-run Job: " + err.Error()}
+				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+					reason: "get smoke-run Job: " + err.Error()}
 			}
 			for _, cond := range k8sJob.Status.Conditions {
 				if cond.Type == "Complete" && cond.Status == "True" {
@@ -469,6 +499,12 @@ func (w *Worker) incL5bSubmitted() {
 func (w *Worker) incL5bErrors() {
 	if w.metrics != nil {
 		w.metrics.IncL5bErrors()
+	}
+}
+
+func (w *Worker) incFailureClassified(class FailureClass, stage string) {
+	if w.metrics != nil {
+		w.metrics.IncFailureClassified(string(class), stage)
 	}
 }
 

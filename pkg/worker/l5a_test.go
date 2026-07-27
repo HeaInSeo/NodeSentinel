@@ -1,8 +1,16 @@
 package worker
 
 import (
+	"context"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // --- computeValidationHash unit tests ---
@@ -110,44 +118,90 @@ func contractResultFor(validationStatus string) string {
 	}
 }
 
-// --- isInfraReason regression tests ---
+// --- isInfraReason removal (Principle 4 centralization) ---
+//
+// isInfraReason (and its five regression tests, formerly here) was removed:
+// it classified an L5-a Job failure purely from the K8s Job-level Failed
+// condition's Reason ("BackoffLimitExceeded"/"DeadlineExceeded" -> infra,
+// everything else -> not infra). Since buildL5aJobSpec sets BackoffLimit=0,
+// *any* single pod failure — OOM, a real deterministic exit-code failure,
+// a scheduling problem, anything — makes the Job controller set Reason to
+// "BackoffLimitExceeded", so isInfraReason effectively always returned true
+// and never actually distinguished failure causes the way L4's
+// classify.go:classifyFromPods does (it inspects pod container terminated
+// states instead of the coarser Job-level reason). This was a duplicate,
+// strictly-worse copy of the same classification job, not a deliberate
+// separate abstraction layer — see waitL5aJob's doc comment in l5a.go for
+// the full analysis — so L5-a now calls classifyFromPods directly instead.
+// TestWaitL5aJob_OOM_ClassifiedAsResourceObservation below is the direct
+// regression coverage for the bug this fixes: an L5-a OOM used to come out
+// misclassified as infra_failed/retryable via isInfraReason; it is now
+// correctly recognized as RESOURCE_OBSERVATION.
 
-// TestIsInfraReason_BackoffLimitExceeded_Regression verifies that the standard
-// K8s Job Failed condition reason is classified as infra.
-func TestIsInfraReason_BackoffLimitExceeded_Regression(t *testing.T) {
-	if !isInfraReason("BackoffLimitExceeded") {
-		t.Error("BackoffLimitExceeded should be an infra reason")
+// TestWaitL5aJob_OOM_ClassifiedAsResourceObservation reproduces the exact
+// scenario isInfraReason used to get wrong: an L5-a Job whose Failed
+// condition Reason is "BackoffLimitExceeded" (what buildL5aJobSpec's
+// BackoffLimit=0 always produces on any single pod failure) but whose pod
+// was actually OOMKilled. The old isInfraReason("BackoffLimitExceeded")
+// would have returned true (infra_failed) with no OOM-specific signal at
+// all; waitL5aJob must now delegate to classifyFromPods and come back
+// FailureClassResourceObservation instead.
+func TestWaitL5aJob_OOM_ClassifiedAsResourceObservation(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	jobName := "l5a-oom-job"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "l5a-oom-pod",
+			Namespace: smokeNamespace,
+			Labels:    map[string]string{"job-name": jobName},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Reason:   "OOMKilled",
+							ExitCode: 137,
+						},
+					},
+				},
+			},
+		},
 	}
-}
-
-// TestIsInfraReason_DeadlineExceeded_Regression verifies that DeadlineExceeded
-// is classified as infra.
-func TestIsInfraReason_DeadlineExceeded_Regression(t *testing.T) {
-	if !isInfraReason("DeadlineExceeded") {
-		t.Error("DeadlineExceeded should be an infra reason")
+	if _, err := kube.CoreV1().Pods(smokeNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod: %v", err)
 	}
-}
 
-// TestIsInfraReason_Evicted_False_Regression verifies that "Evicted" is NOT
-// classified as an infra reason — it is a Pod-level reason, not a K8s Job
-// Failed condition reason (INFO regression).
-func TestIsInfraReason_Evicted_False_Regression(t *testing.T) {
-	if isInfraReason("Evicted") {
-		t.Error("Evicted is a Pod-level reason and must NOT be classified as a Job-level infra reason")
+	k8sJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: smokeNamespace},
+		Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{
+				{
+					Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+					Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
+				},
+			},
+		},
 	}
-}
-
-// TestIsInfraReason_AppFailure_False verifies that a generic application error
-// is not classified as infra.
-func TestIsInfraReason_AppFailure_False(t *testing.T) {
-	if isInfraReason("Error") {
-		t.Error("Error should not be an infra reason")
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Create(context.Background(), k8sJob, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create job: %v", err)
 	}
-}
 
-// TestIsInfraReason_Empty_False verifies that an empty string is not infra.
-func TestIsInfraReason_Empty_False(t *testing.T) {
-	if isInfraReason("") {
-		t.Error("empty string should not be an infra reason")
+	store := newTestStore(t)
+	w := New(store, kube, "test-worker")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, result, err := w.waitL5aJob(ctx, slog.Default(), makeTestWorkJob(), jobName)
+	if err == nil {
+		t.Fatal("expected an error for a Job-Failed condition")
+	}
+	if result.class != FailureClassResourceObservation {
+		t.Errorf("class = %q, want %q — OOM must be detected via pod inspection, not the Job-level "+
+			"BackoffLimitExceeded reason alone", result.class, FailureClassResourceObservation)
 	}
 }

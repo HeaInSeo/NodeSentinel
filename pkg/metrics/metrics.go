@@ -17,6 +17,7 @@ import (
 	promclient "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -32,6 +33,14 @@ type Metrics struct {
 	l5aErrors     metric.Int64Counter
 	l5bSubmitted  metric.Int64Counter
 	l5bErrors     metric.Int64Counter
+
+	// failuresClassified counts pipeline-stage failures by NodeSentinel's
+	// internal retry-policy FailureClass (see pkg/worker/failureclass.go)
+	// and stage. Both label values are drawn from small fixed sets
+	// (FailureClass has 4 values; stage is L3/L4/L5A) — deliberately never
+	// labeled with the raw error/K8s message itself, which would be
+	// unbounded cardinality. See IncFailureClassified's doc comment.
+	failuresClassified metric.Int64Counter
 
 	handler http.Handler
 }
@@ -66,6 +75,7 @@ func New() (*Metrics, error) {
 		{&m.l5aErrors, "nodesentinel_l5a_submit_errors"},
 		{&m.l5bSubmitted, "nodesentinel_l5b_scan_records_submitted"},
 		{&m.l5bErrors, "nodesentinel_l5b_submit_errors"},
+		{&m.failuresClassified, "nodesentinel_failures_classified"},
 	}
 	for _, c := range counters {
 		if *c.dest, err = meter.Int64Counter(c.name); err != nil {
@@ -96,6 +106,18 @@ func (m *Metrics) IncL5bSubmitted() { m.l5bSubmitted.Add(context.Background(), 1
 
 // IncL5bErrors records a failed L5-b ToolScanRecord submission attempt.
 func (m *Metrics) IncL5bErrors() { m.l5bErrors.Add(context.Background(), 1) }
+
+// IncFailureClassified records that a pipeline-stage failure was classified
+// as class (one of pkg/worker's FailureClass values, e.g. "UNKNOWN") at
+// stage (e.g. "L3", "L4", "L5A"). Both are small fixed sets of values —
+// callers must never pass a raw error string or K8s message here, since an
+// unbounded label value defeats Prometheus's cardinality assumptions (see
+// this package's doc comment and issue #6's scope). The full raw signal
+// belongs in a structured log line (slog), not a metric label.
+func (m *Metrics) IncFailureClassified(class, stage string) {
+	m.failuresClassified.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("class", class), attribute.String("stage", stage)))
+}
 
 // Handler returns the /metrics HTTP handler (Prometheus text exposition format).
 func (m *Metrics) Handler() http.Handler { return m.handler }

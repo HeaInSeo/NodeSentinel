@@ -11,12 +11,29 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// outcome describes the result of an L4 smoke-run, classified per
-// docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md section 6.3 / 11.
+// outcome describes the result of a smoke-run/L5-a pod-level classification,
+// per docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md section 6.3 / 11. Used
+// by both L4 (classifySmokeRun, worker.go's runSmokeRun) and L5-a
+// (waitL5aJob) — see this file's doc comment on classifyFromPods for why
+// L5-a was unified onto the same pod-inspection classifier instead of
+// keeping its own, cruder one.
 type outcome struct {
-	success   bool
-	retryable bool // only meaningful when !success
-	reason    string
+	success bool
+	// retryable is the low-level "does this look like the tool's own
+	// fault" signal (only meaningful when !success) — kept distinct from
+	// class's retry *policy*: e.g. OOMKilled sets retryable=true here (it
+	// is not the tool image's fault that it was OOM-killed) but class is
+	// FailureClassResourceObservation, whose retry policy in decideRetry is
+	// nonetheless "never retry" (see FailureClassResourceObservation's doc
+	// comment) — retrying under the same resource ceiling changes nothing.
+	retryable bool
+	// class is NodeSentinel's retry-policy classification for this outcome
+	// (empty/unset when success) — see FailureClass's doc comment. Set
+	// explicitly at each classification site below rather than derived
+	// after the fact from retryable/reason, so each call site's own
+	// knowledge of exactly what it observed drives the classification.
+	class  FailureClass
+	reason string
 }
 
 // classifySmokeRun inspects the K8s Job (and, if available, its Pods) to
@@ -36,7 +53,8 @@ func classifySmokeRun(ctx context.Context, kube kubernetes.Interface, namespace,
 
 	// ctx deadline exceeded while waiting on the job is always infra-level.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return outcome{success: false, retryable: true, reason: "timeout: smoke-run did not complete within the allotted time"}
+		return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+			reason: "timeout: smoke-run did not complete within the allotted time"}
 	}
 
 	for _, cond := range k8sJob.Status.Conditions {
@@ -60,22 +78,30 @@ func classifyFromPods(ctx context.Context, kube kubernetes.Interface, namespace,
 		LabelSelector: "job-name=" + jobName,
 	})
 	if err != nil || len(pods.Items) == 0 {
-		// Can't inspect pods; treat as infra-level since we cannot confirm
-		// the container ever ran.
-		return outcome{success: false, retryable: true, reason: fmt.Sprintf("%s: %s", fallbackReason, fallbackMessage)}
+		// Can't inspect pods at all — genuinely unknown, not confidently
+		// infra: we cannot confirm the container ever ran, but we also have
+		// no positive infra signal (scheduling/image-pull/OOM/etc.) to point
+		// to. retryable stays true (safer default for the low-level signal —
+		// unchanged from before this classification was added), but class is
+		// Unknown so decideRetry applies its tighter one-retry allowance
+		// instead of treating this as a confidently-infra failure.
+		return outcome{success: false, retryable: true, class: FailureClassUnknown,
+			reason: fmt.Sprintf("%s: %s", fallbackReason, fallbackMessage)}
 	}
 
 	for _, pod := range pods.Items {
 		// Scheduling failure: pod never left Pending.
 		if pod.Status.Phase == corev1.PodPending {
-			return outcome{success: false, retryable: true, reason: "scheduling failure: pod did not start running"}
+			return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+				reason: "scheduling failure: pod did not start running"}
 		}
 
 		for _, cs := range pod.Status.ContainerStatuses {
 			if waiting := cs.State.Waiting; waiting != nil {
 				switch waiting.Reason {
 				case "ImagePullBackOff", "ErrImagePull":
-					return outcome{success: false, retryable: true, reason: "image pull failure: " + waiting.Message}
+					return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+						reason: "image pull failure: " + waiting.Message}
 				}
 			}
 
@@ -85,23 +111,31 @@ func classifyFromPods(ctx context.Context, kube kubernetes.Interface, namespace,
 			}
 			switch term.Reason {
 			case "OOMKilled":
-				return outcome{success: false, retryable: true, reason: "OOMKilled"}
+				// The container did run — this is a valid observation, just
+				// one that failed its resource contract under the current
+				// resource conditions. retryable stays true at this
+				// low-level-signal layer (see outcome.retryable's doc
+				// comment: OOM is not the tool's own fault), but class is
+				// ResourceObservation, whose decideRetry policy is "never
+				// retry" — see FailureClassResourceObservation's doc comment
+				// and failureclass.go's wireStatus design note for why.
+				return outcome{success: false, retryable: true, class: FailureClassResourceObservation,
+					reason: "OOMKilled"}
 			case "DeadlineExceeded":
-				return outcome{success: false, retryable: true, reason: "timeout: activeDeadlineSeconds exceeded"}
+				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+					reason: "timeout: activeDeadlineSeconds exceeded"}
 			case "Error", "Completed":
 				if term.ExitCode != 0 {
 					return outcome{
-						success:   false,
-						retryable: false,
-						reason:    fmt.Sprintf("application-level failure: container exited with code %d", term.ExitCode),
+						success: false, retryable: false, class: FailureClassDeterministic,
+						reason: fmt.Sprintf("application-level failure: container exited with code %d", term.ExitCode),
 					}
 				}
 			default:
 				if term.ExitCode != 0 {
 					return outcome{
-						success:   false,
-						retryable: false,
-						reason:    fmt.Sprintf("application-level failure: container exited with code %d (%s)", term.ExitCode, term.Reason),
+						success: false, retryable: false, class: FailureClassDeterministic,
+						reason: fmt.Sprintf("application-level failure: container exited with code %d (%s)", term.ExitCode, term.Reason),
 					}
 				}
 			}
@@ -109,9 +143,14 @@ func classifyFromPods(ctx context.Context, kube kubernetes.Interface, namespace,
 
 		// Pod-level eviction / node problem.
 		if pod.Status.Phase == corev1.PodFailed && pod.Status.Reason != "" {
-			return outcome{success: false, retryable: true, reason: "infra-level failure: " + pod.Status.Reason}
+			return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+				reason: "infra-level failure: " + pod.Status.Reason}
 		}
 	}
 
-	return outcome{success: false, retryable: true, reason: fmt.Sprintf("%s: %s", fallbackReason, fallbackMessage)}
+	// Pods were found and inspected, but none matched a recognized
+	// waiting/terminated/phase signal above — genuinely unknown, same
+	// reasoning as the no-pods-found branch at the top of this function.
+	return outcome{success: false, retryable: true, class: FailureClassUnknown,
+		reason: fmt.Sprintf("%s: %s", fallbackReason, fallbackMessage)}
 }

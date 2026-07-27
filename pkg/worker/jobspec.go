@@ -62,10 +62,28 @@ func buildSmokeJobSpec(job *work.Job) *batchv1.Job {
 	}
 }
 
-// smokeJobName derives a deterministic, DNS-1123-safe Job name from the
-// work.Job's ID so re-leasing (e.g. after a retry) is traceable back to it.
+// smokeJobName derives a DNS-1123-safe Job name from the work.Job's ID *and*
+// its current attempt number (work.Job.Attempt, incremented on every
+// LeaseJob call — see pkg/work/sqlite/store.go), so it stays traceable back
+// to the WorkStore job while also being unique per attempt.
+//
+// Before the attempt suffix was added, a retried job reused the exact same
+// K8s Job name across attempts. That collided in a reachable, non-crash
+// scenario: runSmokeRun's poll loop's Get error path (transient K8s API
+// failure) returns a retryable outcome without deleting the in-flight K8s
+// Job object first (unlike the Complete/Failed/ctx.Done() paths, which all
+// clean up before returning) — see runSmokeRun. The job then gets requeued
+// (FailJob(..., retryable=true)) and re-leased while its previous attempt's
+// K8s Job object is often still present (its own TTLSecondsAfterFinished
+// only starts counting once *it* finishes, and this one never did), so the
+// next attempt's Create call at the top of runSmokeRun fails with
+// AlreadyExists — immediately, deterministically, every time this exact
+// sequence recurs, not just on worker-crash/lease-expiry reclaim. The
+// attempt suffix removes the collision at its root: every attempt gets its
+// own K8s Job name regardless of whether the previous attempt's object was
+// ever cleaned up.
 func smokeJobName(job *work.Job) string {
-	return fmt.Sprintf("smoke-%s", sanitizeDNSLabel(job.JobID))
+	return fmt.Sprintf("smoke-%s-%d", sanitizeDNSLabel(job.JobID), job.Attempt)
 }
 
 // sanitizeDNSLabel lowercases and strips characters that are not valid in a
