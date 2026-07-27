@@ -4,6 +4,7 @@ LOCALBIN ?= $(CURDIR)/bin
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 GOLANGCI_LINT_VERSION ?= v2.11.3
 GOVULNCHECK ?= $(LOCALBIN)/govulncheck
+GOVULNCHECK_VERSION ?= v1.1.4
 COVERAGE_THRESHOLD ?= 70.0
 SERVICE_PACKAGES = $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/protos/' | grep -v '/test/k8s')
 K8S_TEST_PACKAGES = ./test/k8s/...
@@ -69,7 +70,7 @@ lint-config: $(GOLANGCI_LINT)
 
 $(GOVULNCHECK):
 	@mkdir -p "$(LOCALBIN)"
-	GOBIN="$(LOCALBIN)" go install golang.org/x/vuln/cmd/govulncheck@latest
+	GOBIN="$(LOCALBIN)" go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
 # ── Proto lint (Buf) ─────────────────────────────────────────────────────────
 buf-lint:

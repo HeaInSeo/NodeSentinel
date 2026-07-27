@@ -18,6 +18,8 @@ concurrency:
 env:
   GO_VERSION_FILE: go.mod
   GOLANGCI_LINT_VERSION: v2.11.3
+  GOVULNCHECK_VERSION: v1.1.4
+  ACTIONLINT_VERSION: v1.7.7
   COVERAGE_THRESHOLD: "70.0"
 
 jobs:
@@ -36,7 +38,7 @@ jobs:
           cache: true
 
       - name: actionlint
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@latest -shellcheck=
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}" -shellcheck=
 
   # ──────────────────────────────────────────────────────────────────
   # 1. Proto API lint (Buf)
