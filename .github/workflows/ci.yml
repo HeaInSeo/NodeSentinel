@@ -54,6 +54,9 @@ jobs:
         with:
           input: protos
           lint: true
+          format: true
+          breaking: true
+          pr_comment: false
 
   # ──────────────────────────────────────────────────────────────────
   # 2. 린트 (golangci-lint)
