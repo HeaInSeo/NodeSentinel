@@ -187,6 +187,55 @@ func TestExpiredLeaseCanBeReclaimed(t *testing.T) {
 	}
 }
 
+// TestExpiredLeaseCanBeReclaimedAfterHeartbeat reproduces the restart-recovery
+// bug in https://github.com/HeaInSeo/NodeSentinel/issues/15: a job that has
+// been heartbeated at least once is in status='running', not 'leased'.
+// Heartbeat runs every 30s while jobs can take up to several minutes, so
+// 'running' - not 'leased' - is the status a worker-crashed job is actually
+// in most of the time. Before the fix, LeaseJob's reclaim query only matched
+// 'queued' or a stale 'leased' row, so a stale 'running' row was never
+// reclaimed and the job was stranded forever.
+func TestExpiredLeaseCanBeReclaimedAfterHeartbeat(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-stale-running")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	firstLease, err := store.LeaseJob(ctx, "worker-a", time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseJob worker-a: %v", err)
+	}
+
+	// Heartbeat with a negative TTL: transitions the job to 'running' and
+	// simultaneously makes that heartbeat's lease_until stale, simulating a
+	// worker that heartbeated once and then crashed.
+	if err := store.Heartbeat(ctx, firstLease.JobID, "worker-a", -time.Second); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	stale, err := store.GetJob(ctx, firstLease.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stale.Status != work.StatusRunning {
+		t.Fatalf("status after heartbeat = %q, want %q (test setup invariant)", stale.Status, work.StatusRunning)
+	}
+
+	secondLease, err := store.LeaseJob(ctx, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseJob worker-b: %v (stale running job was not reclaimed - it would be stranded forever)", err)
+	}
+	if secondLease.JobID != firstLease.JobID {
+		t.Fatalf("reclaimed job = %q, want %q", secondLease.JobID, firstLease.JobID)
+	}
+	if secondLease.LeaseOwner != "worker-b" {
+		t.Fatalf("second lease owner = %q, want worker-b", secondLease.LeaseOwner)
+	}
+	if secondLease.Status != work.StatusLeased {
+		t.Fatalf("status after reclaim = %q, want %q", secondLease.Status, work.StatusLeased)
+	}
+}
+
 func TestWrongWorkerCannotFailJob(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()

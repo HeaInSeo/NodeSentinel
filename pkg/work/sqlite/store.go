@@ -416,9 +416,15 @@ func (s *Store) LeaseJob(ctx context.Context, worker string, ttl time.Duration) 
 	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().UTC()
+	// A job past its lease deadline is reclaimable regardless of whether it's
+	// still 'leased' (never heartbeated) or has progressed to 'running'
+	// (heartbeated at least once). Without matching 'running' here, a worker
+	// that crashes after a job's first heartbeat strands that job forever -
+	// Heartbeat moves it out of 'leased' well before most jobs finish, so
+	// 'running' is the status a stale, worker-crashed job is actually in.
 	const selectSQL = `
 SELECT job_id FROM jobs
-WHERE status = ? OR (status = ? AND (lease_until IS NULL OR lease_until < ?))
+WHERE status = ? OR (status IN (?, ?) AND (lease_until IS NULL OR lease_until < ?))
 ORDER BY created_at ASC
 LIMIT 1
 `
@@ -428,6 +434,7 @@ LIMIT 1
 		selectSQL,
 		work.StatusQueued,
 		work.StatusLeased,
+		work.StatusRunning,
 		now.Format(time.RFC3339Nano),
 	).Scan(&jobID)
 	if err != nil {
