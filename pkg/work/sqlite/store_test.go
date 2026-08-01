@@ -236,6 +236,57 @@ func TestExpiredLeaseCanBeReclaimedAfterHeartbeat(t *testing.T) {
 	}
 }
 
+// TestEnqueuedJobSurvivesStoreRestart exercises the real durable-enqueue
+// contract end-to-end: CreateJob (the store-level equivalent of
+// EnqueueValidationWork) is followed by closing the store and reopening a
+// brand-new *Store at the same file path - simulating a process restart -
+// then confirming the job is still there and still leasable. Existing
+// migration-focused reopen tests seed rows via raw SQL that bypasses
+// CreateJob entirely, so they prove file persistence but not this specific
+// enqueue-then-restart contract.
+func TestEnqueuedJobSurvivesStoreRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "nodesentinel.sqlite")
+
+	store, err := sqlite.New(path)
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	created, err := store.CreateJob(ctx, sampleRequest("job-survives-restart"))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen at the same path - a fresh *Store, exactly what a restarted
+	// process would construct.
+	reopened, err := sqlite.New(path)
+	if err != nil {
+		t.Fatalf("sqlite.New (reopen): %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	got, err := reopened.GetJob(ctx, created.JobID)
+	if err != nil {
+		t.Fatalf("GetJob after restart: %v", err)
+	}
+	if got.Status != work.StatusQueued {
+		t.Fatalf("status after restart = %q, want %q", got.Status, work.StatusQueued)
+	}
+
+	// Not just present in the row - actually leasable, proving the restart
+	// didn't leave it in some state a worker couldn't pick up.
+	leased, err := reopened.LeaseJob(ctx, "worker-after-restart", time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseJob after restart: %v", err)
+	}
+	if leased.JobID != created.JobID {
+		t.Fatalf("leased job = %q, want %q", leased.JobID, created.JobID)
+	}
+}
+
 func TestWrongWorkerCannotFailJob(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
