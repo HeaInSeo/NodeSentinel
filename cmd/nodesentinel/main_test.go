@@ -196,7 +196,8 @@ func TestGracefulShutdown_DrainsHTTPAndGRPCOnCtxCancel(t *testing.T) {
 		t.Fatal("shutdown did not complete within 10s - goroutines did not drain")
 	}
 
-	if _, err := http.Get("http://" + httpAddr + "/healthz"); err == nil {
+	if resp, err := http.Get("http://" + httpAddr + "/healthz"); err == nil {
+		_ = resp.Body.Close()
 		t.Fatal("HTTP server still accepting connections after graceful shutdown")
 	}
 }
