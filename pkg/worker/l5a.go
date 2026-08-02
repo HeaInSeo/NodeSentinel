@@ -42,7 +42,11 @@ func l5aCommandSlice() []string {
 // l5aCommand를 실제 도구 실행으로 바꾸더라도 산출물이 나갈 경로가 없어
 // 결과가 Pod와 함께 사라진다. 관측을 성립시키려면 명령 교체(OBS-1)보다
 // 먼저 volume·resources 추가(OBS-2)가 필요하다.
-// Resources 부재는 반복 실행 간 output digest 비교(gap #20)의 장애이기도 하다.
+// 출력 경로가 없는 것은 VolumeMounts 부재 때문이다. Resources는 별개 축이며
+// output digest 비교의 선행 조건이 아니다 —
+// docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md §8.1·§8.4가 리소스 수치
+// (peakCpu/peakMemory/duration/diskIO 등)를 validationHash에서 명시적으로 제외한다.
+// Resources 부재는 실행 환경이 무제한이라는 별도 문제이며 OBS-2에서 volume 추가와 함께 다룬다.
 func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 	backoff := int32(0)
 	deadline := int64(l5aJobTimeout)
