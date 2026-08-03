@@ -37,6 +37,16 @@ func l5aCommandSlice() []string {
 }
 
 // buildL5aJobSpec constructs the K8s Job for L5-a functional validation.
+//
+// ⚠ 이 Job spec에는 VolumeMounts·Resources·Env가 없다. 따라서
+// l5aCommand를 실제 도구 실행으로 바꾸더라도 산출물이 나갈 경로가 없어
+// 결과가 Pod와 함께 사라진다. 관측을 성립시키려면 명령 교체(OBS-1)보다
+// 먼저 volume·resources 추가(OBS-2)가 필요하다.
+// 출력 경로가 없는 것은 VolumeMounts 부재 때문이다. Resources는 별개 축이며
+// output digest 비교의 선행 조건이 아니다 —
+// docs/NODESENTINEL_VALIDATION_FLOW_SPEC_v0.1.md §8.1·§8.4가 리소스 수치
+// (peakCpu/peakMemory/duration/diskIO 등)를 validationHash에서 명시적으로 제외한다.
+// Resources 부재는 실행 환경이 무제한이라는 별도 문제이며 OBS-2에서 volume 추가와 함께 다룬다.
 func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 	backoff := int32(0)
 	deadline := int64(l5aJobTimeout)
@@ -126,6 +136,14 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, exitCode, durationSec, result))
 	}
 
+	// ⚠ 이 validationHash는 검증 증거가 아니다.
+	// 입력은 (ImageDigest, command, exitCode)인데 성공 시 command는 항상
+	// l5aCommand("/bin/sh -c true") 상수이고 exitCode는 0이므로, 결과적으로
+	// ImageDigest의 다른 표현일 뿐이다. 아래 allOutputsPresent도 관측이
+	// 아니라 하드코딩된 true다.
+	// 정본 CANONICAL-R7 §21.27.3 O1·O3에 따라 이 값을 "검증됨"의 근거로
+	// 인용하지 않는다. 실제 관측은 로드맵 OBS-3~OBS-6에서 구현하며
+	// validationHash 입력 재정의는 OBS-8이다. gap-register #21 참조.
 	validationHash := computeValidationHash(job.ImageDigest, command, exitCode)
 	logger.Info("L5-a validation succeeded", "validation_hash", validationHash)
 	return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
