@@ -96,6 +96,7 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		Terminal:       true,
 		Scanner:        matched.Scanner,
 		ScannerVersion: matched.ScannerVersion,
+		ScannedAt:      matched.ScannedAt,
 		Source:         "trivy-operator",
 		CriticalCount:  matched.CriticalCount,
 		HighCount:      matched.HighCount,
@@ -144,6 +145,7 @@ func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.
 type trivyVulnSummary struct {
 	Scanner        string
 	ScannerVersion string
+	ScannedAt      string
 	CriticalCount  int
 	HighCount      int
 	MediumCount    int
@@ -156,6 +158,11 @@ func parseTrivySummary(obj map[string]interface{}) *trivyVulnSummary {
 	s := &trivyVulnSummary{}
 	s.Scanner, _ = nestedStr(obj, "report", "scanner", "name")
 	s.ScannerVersion, _ = nestedStr(obj, "report", "scanner", "version")
+	s.ScannedAt = firstNestedStr(obj,
+		[]string{"report", "scannedAt"},
+		[]string{"report", "scanned_at"},
+		[]string{"report", "updateTimestamp"},
+	)
 	if summary, ok := nestedMap(obj, "report", "summary"); ok {
 		s.CriticalCount = nestedInt(summary, "criticalCount")
 		s.HighCount = nestedInt(summary, "highCount")
@@ -163,6 +170,15 @@ func parseTrivySummary(obj map[string]interface{}) *trivyVulnSummary {
 		s.LowCount = nestedInt(summary, "lowCount")
 	}
 	return s
+}
+
+func firstNestedStr(obj map[string]interface{}, paths ...[]string) string {
+	for _, path := range paths {
+		if value, ok := nestedStr(obj, path...); ok {
+			return value
+		}
+	}
+	return ""
 }
 
 // nestedStr walks nested map[string]interface{} and returns the string at

@@ -13,6 +13,7 @@ func makeTrivyObj(scanner, version string, critical, high, medium, low int) map[
 				"name":    scanner,
 				"version": version,
 			},
+			"updateTimestamp": "2026-08-05T01:02:03Z",
 			"summary": map[string]interface{}{
 				"criticalCount": float64(critical),
 				"highCount":     float64(high),
@@ -48,6 +49,9 @@ func TestParseTrivySummary_HappyPath(t *testing.T) {
 	}
 	if s.LowCount != 3 {
 		t.Errorf("LowCount: want 3, got %d", s.LowCount)
+	}
+	if s.ScannedAt != "2026-08-05T01:02:03Z" {
+		t.Errorf("ScannedAt: want %q, got %q", "2026-08-05T01:02:03Z", s.ScannedAt)
 	}
 }
 

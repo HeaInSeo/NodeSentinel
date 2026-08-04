@@ -51,6 +51,7 @@ func buildVulnReport(name, namespace, digest, scanner string, critical, high, me
 					"name":    scanner,
 					"version": "0.50.0",
 				},
+				"updateTimestamp": "2026-08-05T01:02:03Z",
 				"summary": map[string]interface{}{
 					"criticalCount": float64(critical),
 					"highCount":     float64(high),
@@ -147,6 +148,9 @@ func TestRunL5b_MatchingReport_Passed(t *testing.T) {
 	}
 	if capturedBody["policy_result"] != "passed" {
 		t.Errorf("expected policy_result=passed, got %v", capturedBody["policy_result"])
+	}
+	if capturedBody["scanned_at"] != "2026-08-05T01:02:03Z" {
+		t.Errorf("expected scanned_at from VulnerabilityReport, got %v", capturedBody["scanned_at"])
 	}
 }
 

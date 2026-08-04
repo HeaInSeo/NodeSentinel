@@ -154,6 +154,7 @@ type SubmitScanRecordRequest struct {
 
 	Scanner        string `json:"scanner,omitempty"`
 	ScannerVersion string `json:"scanner_version,omitempty"`
+	ScannedAt      string `json:"scanned_at,omitempty"`
 	Source         string `json:"source,omitempty"`
 	CriticalCount  int    `json:"critical_count"`
 	HighCount      int    `json:"high_count"`

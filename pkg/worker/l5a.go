@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -136,19 +135,15 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, exitCode, durationSec, result))
 	}
 
-	// ⚠ 이 validationHash는 검증 증거가 아니다.
-	// 입력은 (ImageDigest, command, exitCode)인데 성공 시 command는 항상
-	// l5aCommand("/bin/sh -c true") 상수이고 exitCode는 0이므로, 결과적으로
-	// ImageDigest의 다른 표현일 뿐이다. 아래 allOutputsPresent도 관측이
-	// 아니라 하드코딩된 true다.
-	// 정본 CANONICAL-R7 §21.27.3 O1·O3에 따라 이 값을 "검증됨"의 근거로
-	// 인용하지 않는다. 실제 관측은 로드맵 OBS-3~OBS-6에서 구현하며
-	// validationHash 입력 재정의는 OBS-8이다. gap-register #21 참조.
-	validationHash := computeValidationHash(job.ImageDigest, command, exitCode)
-	logger.Info("L5-a validation succeeded", "validation_hash", validationHash)
+	// The current L5-a Job only observes that the validation command completed.
+	// It does not capture declared outputs/resources, so validationHash and
+	// allOutputsPresent must remain not-observed instead of being inferred from
+	// image digest, command, or exit code. Real output/resource observation is
+	// the prerequisite before either field can be submitted as evidence.
+	logger.Info("L5-a validation command succeeded; output/resource evidence not observed")
 	return w.submitCheckRecord(ctx, logger, job, checkRecordSubmission{
 		checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
-		validationStatus: "succeeded", validationHash: validationHash, allOutputsPresent: true,
+		validationStatus: "succeeded",
 	})
 }
 
@@ -338,13 +333,4 @@ func (w *Worker) submitCheckRecord(
 	}
 	logger.Info("check record submitted", "check_id", sub.checkID, "stage", sub.stage, "status", sub.validationStatus)
 	return nil
-}
-
-// computeValidationHash computes a deterministic SHA-256 hash over the inputs
-// that define a successful functional validation run. Per spec: timestamps,
-// resource profiles, and stdout/stderr are excluded for reproducibility.
-func computeValidationHash(imageDigest, command string, exitCode int) string {
-	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%s|%s|%d", imageDigest, command, exitCode)
-	return fmt.Sprintf("%x", h.Sum(nil))
 }

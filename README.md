@@ -24,7 +24,7 @@ NodeSentinel은 **검증 에이전트**다.
 |------|------|
 | **L3** | K8s Job dry-run — manifest admission 검증 (API server가 거부하는 spec 사전 차단) |
 | **L4** | K8s smoke run — 컨테이너를 실제 기동해 정상 종료 여부 확인 |
-| **L5-a** | functional validation Job 실행 → `validationHash` 계산 → `POST /v1/validation/check-records` |
+| **L5-a** | functional validation Job 실행 → 관측된 check evidence만 `POST /v1/validation/check-records` |
 | **L5-b** | trivy-operator `VulnerabilityReport` 조회 → `POST /v1/validation/scan-records` |
 
 L3 또는 L4가 실패하면 L5 단계는 실행되지 않는다.
@@ -47,7 +47,7 @@ NodeSentinel (이 프로젝트)
     │
     ├── L3: K8s Job dry-run
     ├── L4: K8s smoke run
-    ├── L5-a: functional validation → validationHash → POST /v1/validation/check-records
+    ├── L5-a: functional validation → observed check evidence → POST /v1/validation/check-records
     └── L5-b: trivy-operator VulnerabilityReport → POST /v1/validation/scan-records
 
 NodeVault

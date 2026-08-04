@@ -231,6 +231,12 @@ func TestRunL5a_Success_NotTerminal_WhenL5bAlsoPlanned(t *testing.T) {
 	if got.Terminal {
 		t.Error("Terminal = true, want false — terminal=false was passed in (L5-b still runs after L5-a)")
 	}
+	if got.ValidationHash != "" {
+		t.Errorf("ValidationHash = %q, want empty without output/resource observation", got.ValidationHash)
+	}
+	if got.AllOutputsPresent {
+		t.Error("AllOutputsPresent = true, want false/omitted without output observation")
+	}
 }
 
 // TestRunL5a_Success_Terminal_WhenL5aIsLastStage verifies that runL5a honors
