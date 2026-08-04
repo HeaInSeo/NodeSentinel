@@ -9,10 +9,15 @@ import (
 func makeTrivyObj(scanner, version string, critical, high, medium, low int) map[string]interface{} {
 	obj := map[string]interface{}{
 		"report": map[string]interface{}{
-			"scanner": map[string]interface{}{
-				"name":    scanner,
-				"version": version,
+			"artifact": map[string]interface{}{
+				"platform": "linux/amd64",
 			},
+			"scanner": map[string]interface{}{
+				"name":     scanner,
+				"version":  version,
+				"dbDigest": "sha256:trivydb",
+			},
+			"updateTimestamp": "2026-08-05T01:02:03Z",
 			"summary": map[string]interface{}{
 				"criticalCount": float64(critical),
 				"highCount":     float64(high),
@@ -48,6 +53,15 @@ func TestParseTrivySummary_HappyPath(t *testing.T) {
 	}
 	if s.LowCount != 3 {
 		t.Errorf("LowCount: want 3, got %d", s.LowCount)
+	}
+	if s.Platform != "linux/amd64" {
+		t.Errorf("Platform: want %q, got %q", "linux/amd64", s.Platform)
+	}
+	if s.DBDigest != "sha256:trivydb" {
+		t.Errorf("DBDigest: want %q, got %q", "sha256:trivydb", s.DBDigest)
+	}
+	if s.ScannedAt != "2026-08-05T01:02:03Z" {
+		t.Errorf("ScannedAt: want %q, got %q", "2026-08-05T01:02:03Z", s.ScannedAt)
 	}
 }
 

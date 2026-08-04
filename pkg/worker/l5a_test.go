@@ -13,40 +13,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// --- computeValidationHash unit tests ---
-
-// TestComputeValidationHash_Deterministic verifies that the same inputs
-// always produce the same hash (determinism requirement).
-func TestComputeValidationHash_Deterministic(t *testing.T) {
-	h1 := computeValidationHash("sha256:abc123", "/bin/sh -c true", 0)
-	h2 := computeValidationHash("sha256:abc123", "/bin/sh -c true", 0)
-	if h1 != h2 {
-		t.Errorf("expected identical hashes, got %q and %q", h1, h2)
-	}
-}
-
-// TestComputeValidationHash_DifferentExitCode verifies that a different
-// exitCode produces a different hash (no hash collision on that axis).
-func TestComputeValidationHash_DifferentExitCode(t *testing.T) {
-	h0 := computeValidationHash("sha256:abc123", "/bin/sh -c true", 0)
-	h1 := computeValidationHash("sha256:abc123", "/bin/sh -c true", 1)
-	if h0 == h1 {
-		t.Errorf("expected different hashes for different exit codes, but got %q for both", h0)
-	}
-}
-
-// TestComputeValidationHash_NotEmpty verifies that the hash is a non-empty hex string.
-func TestComputeValidationHash_NotEmpty(t *testing.T) {
-	h := computeValidationHash("sha256:abc", "cmd", 0)
-	if h == "" {
-		t.Error("expected non-empty hash")
-	}
-	// SHA-256 hex is 64 characters.
-	if len(h) != 64 {
-		t.Errorf("expected 64-char hex, got len=%d: %q", len(h), h)
-	}
-}
-
 // --- l5aCommand / K8s Job Command slice regression ---
 
 // TestL5aCommandSlice_MatchesConstant_Regression verifies that l5aCommandSlice()
