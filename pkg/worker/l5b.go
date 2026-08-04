@@ -96,8 +96,6 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		Terminal:       true,
 		Scanner:        matched.Scanner,
 		ScannerVersion: matched.ScannerVersion,
-		Platform:       matched.Platform,
-		DBDigest:       matched.DBDigest,
 		ScannedAt:      matched.ScannedAt,
 		Source:         "trivy-operator",
 		CriticalCount:  matched.CriticalCount,
@@ -147,8 +145,6 @@ func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.
 type trivyVulnSummary struct {
 	Scanner        string
 	ScannerVersion string
-	Platform       string
-	DBDigest       string
 	ScannedAt      string
 	CriticalCount  int
 	HighCount      int
@@ -162,13 +158,6 @@ func parseTrivySummary(obj map[string]interface{}) *trivyVulnSummary {
 	s := &trivyVulnSummary{}
 	s.Scanner, _ = nestedStr(obj, "report", "scanner", "name")
 	s.ScannerVersion, _ = nestedStr(obj, "report", "scanner", "version")
-	s.Platform, _ = nestedStr(obj, "report", "artifact", "platform")
-	s.DBDigest = firstNestedStr(obj,
-		[]string{"report", "scanner", "dbDigest"},
-		[]string{"report", "scanner", "db_digest"},
-		[]string{"report", "scanner", "databaseDigest"},
-		[]string{"report", "scanner", "database", "digest"},
-	)
 	s.ScannedAt = firstNestedStr(obj,
 		[]string{"report", "scannedAt"},
 		[]string{"report", "scanned_at"},
