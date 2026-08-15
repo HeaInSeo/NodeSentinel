@@ -213,8 +213,8 @@ func (s *Store) migrateValidationRequestID(ctx context.Context) error {
 		return err
 	}
 	if !hasIDCol {
-		if _, err := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN validation_request_id TEXT`); err != nil {
-			return fmt.Errorf("add validation_request_id column: %w", err)
+		if _, execErr := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN validation_request_id TEXT`); execErr != nil {
+			return fmt.Errorf("add validation_request_id column: %w", execErr)
 		}
 	}
 
@@ -696,19 +696,23 @@ LIMIT ?
 	if err != nil {
 		return nil, fmt.Errorf("select claimable deliveries: %w", err)
 	}
-	var jobIDs []string
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("scan claimable job_id: %w", scanErr)
+	jobIDs, err := func() ([]string, error) {
+		defer func() { _ = rows.Close() }()
+		var ids []string
+		for rows.Next() {
+			var id string
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				return nil, fmt.Errorf("scan claimable job_id: %w", scanErr)
+			}
+			ids = append(ids, id)
 		}
-		jobIDs = append(jobIDs, id)
-	}
-	rowsErr := rows.Err()
-	_ = rows.Close()
-	if rowsErr != nil {
-		return nil, fmt.Errorf("iterate claimable deliveries: %w", rowsErr)
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return nil, fmt.Errorf("iterate claimable deliveries: %w", rowsErr)
+		}
+		return ids, nil
+	}()
+	if err != nil {
+		return nil, err
 	}
 	if len(jobIDs) == 0 {
 		if err := tx.Commit(); err != nil {
