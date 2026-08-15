@@ -163,11 +163,15 @@ func newHTTPServer(m *metrics.Metrics, listenAddr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			slog.Debug("healthz response write failed", "err", err)
+		}
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready"))
+		if _, err := w.Write([]byte("ready")); err != nil {
+			slog.Debug("readyz response write failed", "err", err)
+		}
 	})
 	mux.Handle("/metrics", m.Handler())
 	return &http.Server{
