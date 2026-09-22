@@ -128,10 +128,25 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		created = jobSpec
 	case err != nil:
 		logger.Warn("L5-a job creation failed", "err", err)
-		// Nothing runs under this identity any more: L4 has finished and the
-		// L5-a Job was never created. process() left the identity open for
-		// L5-a (see l5aFollows), so release it here.
-		w.markExecutionTerminal(ctx, logger, job.JobID)
+		if createRejected(err) {
+			// Nothing runs under this identity any more: L4 has finished and
+			// the L5-a Job was never created. process() left the identity
+			// open for L5-a (see l5aFollows), so release it here.
+			w.markExecutionTerminal(ctx, logger, job.JobID)
+		} else {
+			// The Create may have been persisted despite the error (see
+			// runSmokeRun). Adopt the deterministic name if it exists;
+			// otherwise leave the identity adoptable instead of releasing it
+			// while a Job may be running.
+			found, getErr := w.jobExists(l5aCtx, smokeNamespace, jobSpec.Name)
+			if getErr == nil && found {
+				logger.Info("L5-a validation Job exists despite create error — adopting", "k8s_job", jobSpec.Name)
+				created = jobSpec
+				break
+			}
+			logger.Warn("L5-a: validation Job create outcome unknown — leaving execution adoptable",
+				"k8s_job", jobSpec.Name, "get_err", getErr)
+		}
 		w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, err.Error())
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
 			outcome{class: FailureClassTransientInfra, reason: "infra-level: job creation failed: " + err.Error()}))

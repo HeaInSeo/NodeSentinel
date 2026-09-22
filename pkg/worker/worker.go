@@ -504,14 +504,27 @@ func (w *Worker) runSmokeRun(
 			// it. Creating a differently-named Job here is what produced
 			// concurrent duplicates before.
 			logger.Info("L4 smoke-run Job already exists — adopting", "k8s_job", name)
-		case err != nil:
-			// Creation failed, so nothing is running under this identity.
-			// Release it rather than stranding the job: leaving it
-			// non-terminal would make every later attempt try to adopt a Job
-			// that was never created.
+		case createRejected(err):
+			// The API server refused the object, so nothing is running under
+			// this identity. Release it rather than stranding the job: leaving
+			// it non-terminal would make every later attempt try to adopt a
+			// Job that was never created.
 			w.markExecutionTerminal(ctx, logger, job.JobID)
 			return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
 				reason: "failed to create smoke-run Job: " + err.Error()}
+		case err != nil:
+			// The Create may have been persisted even though this call failed
+			// (lost response, timeout, 5xx). Look the deterministic name up
+			// instead of releasing the identity: a fresh identity would put a
+			// second Job beside one that may be running.
+			found, getErr := w.jobExists(ctx, ns, name)
+			if getErr != nil || !found {
+				logger.Warn("L4: smoke-run Job create outcome unknown — leaving execution adoptable",
+					"k8s_job", name, "err", err, "get_err", getErr)
+				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+					reason: "create smoke-run Job (outcome unknown): " + err.Error()}
+			}
+			logger.Info("L4 smoke-run Job exists despite create error — adopting", "k8s_job", name, "err", err)
 		default:
 			name = created.Name
 			logger.Info("L4 smoke-run Job created", "k8s_job", name)
@@ -754,6 +767,18 @@ func (w *Worker) deleteAndConfirmGone(ns, name string) error {
 
 // jobExists reports whether Job name exists. A non-NotFound API error is
 // returned as-is: the caller cannot tell either way.
+// createRejected reports whether err, returned by a Job Create, proves the
+// API server refused the object so that nothing was persisted. Any other
+// error (a timeout, a 5xx, a lost response) leaves the outcome unknown: the
+// Job may exist and be running.
+func createRejected(err error) bool {
+	return apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) ||
+		apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) ||
+		apierrors.IsNotFound(err) || apierrors.IsMethodNotSupported(err) ||
+		apierrors.IsNotAcceptable(err) || apierrors.IsUnsupportedMediaType(err) ||
+		apierrors.IsRequestEntityTooLargeError(err) || apierrors.IsTooManyRequests(err)
+}
+
 func (w *Worker) jobExists(ctx context.Context, ns, name string) (bool, error) {
 	_, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 	switch {

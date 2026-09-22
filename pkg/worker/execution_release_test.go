@@ -10,12 +10,14 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
 
@@ -439,7 +441,216 @@ func TestProcess_LegacyJobNotConfirmedGone_MintsNothing(t *testing.T) {
 	}
 }
 
+var jobsGVR = batchv1.SchemeGroupVersion.WithResource("jobs")
+
+// failRealCreate makes every real (non-dry-run) create of a Job whose name
+// starts with prefix fail with createErr. When persist is true the Job is
+// stored first, as when the API server writes the object and the response is
+// lost or times out.
+func failRealCreate(kube *fake.Clientset, prefix string, persist bool, createErr error) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ca, ok := action.(k8stesting.CreateActionImpl)
+		if !ok || len(ca.GetCreateOptions().DryRun) > 0 {
+			return false, nil, nil
+		}
+		j, ok := ca.GetObject().(*batchv1.Job)
+		if !ok || !strings.HasPrefix(j.Name, prefix) {
+			return false, nil, nil
+		}
+		if persist {
+			if err := kube.Tracker().Create(jobsGVR, j, ca.GetNamespace()); err != nil {
+				return true, nil, err
+			}
+		}
+		return true, nil, createErr
+	}
+}
+
+// completeIfStoredReactor reports a stored Job as Complete and a missing one
+// as NotFound, so an observation succeeds only for a Job that really exists.
+func completeIfStoredReactor(kube *fake.Clientset) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ga := action.(k8stesting.GetActionImpl)
+		obj, err := kube.Tracker().Get(jobsGVR, ga.GetNamespace(), ga.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		j := obj.(*batchv1.Job).DeepCopy()
+		j.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		return true, j, nil
+	}
+}
+
+func errCreateTimedOut() error {
+	return k8serrors.NewTimeoutError("create timed out; the object may have been persisted", 1)
+}
+
+// TestProcess_AmbiguousL4Create_JobPersisted_Adopts: Create returns a
+// timeout but the API server did store the Job. The attempt must find that
+// Job under its deterministic name and observe it. Releasing the identity
+// instead would let the retry mint a new one and run a second Job beside it.
+func TestProcess_AmbiguousL4Create_JobPersisted_Adopts(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "smoke-", true, errCreateTimedOut()))
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+
+	created, err := store.CreateJob(context.Background(), newSmokeRunOnlyJob())
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	New(store, kube, "test-worker").process(context.Background(), job)
+
+	final, err := store.GetJob(context.Background(), created.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if final.Status != work.StatusSucceeded {
+		t.Fatalf("final Status = %q (LastError %q), want succeeded by observing the persisted Job",
+			final.Status, final.LastError)
+	}
+	if got := realJobCreates(kube); len(got) != 1 {
+		t.Fatalf("real Job creates = %v, want exactly one", got)
+	}
+}
+
+// TestProcess_AmbiguousL4Create_NotFound_StaysAdoptable: Create times out and
+// the Job cannot be found yet. The write may still land, so the identity must
+// stay adoptable and the retry must run under the same identity.
+func TestProcess_AmbiguousL4Create_NotFound_StaysAdoptable(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "smoke-", false, errCreateTimedOut()))
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+
+	job := leaseFresh(t, store, "ambiguous-create")
+	New(store, kube, "test-worker").process(context.Background(), job)
+
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.Status != work.StatusQueued {
+		t.Fatalf("Status = %q (LastError %q), want queued for a retry", stored.Status, stored.LastError)
+	}
+	if stored.ExecutionID == "" || stored.ExecutionTerminal {
+		t.Fatalf("identity %q terminal=%v after a create whose outcome is unknown — want it kept adoptable, "+
+			"or a late-persisted Job runs beside the retry's Job under a fresh identity",
+			stored.ExecutionID, stored.ExecutionTerminal)
+	}
+}
+
+// TestProcess_RejectedL4Create_ReleasesIdentity: an Invalid error proves the
+// API server stored nothing, so the identity is released as before.
+func TestProcess_RejectedL4Create_ReleasesIdentity(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	rejected := k8serrors.NewInvalid(batchv1.SchemeGroupVersion.WithKind("Job").GroupKind(), "smoke", nil)
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "smoke-", false, rejected))
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+
+	job := leaseFresh(t, store, "rejected-create")
+	New(store, kube, "test-worker").process(context.Background(), job)
+
+	if got := realJobCreates(kube); len(got) != 1 {
+		t.Fatalf("real Job creates = %v, want exactly one rejected create", got)
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if !stored.ExecutionTerminal {
+		t.Fatal("identity left adoptable after a rejected create — the retry would observe a Job that never existed")
+	}
+}
+
+// runL5aWithFailedCreate runs a smoke_run+profile job whose L5-a Create fails
+// with a timeout, optionally after the Job was stored. It returns the stored
+// row and the L5-a check records sent to NodeVault.
+func runL5aWithFailedCreate(t *testing.T, jobID string, persist bool) (*work.Job, []capturedSubmission) {
+	t.Helper()
+	useFastWorkerTicks(t)
+
+	var captured []capturedSubmission
+	vc := capturingVaultServer(t, &captured)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "l5a-", persist, errCreateTimedOut()))
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+
+	req := newTestJob()
+	req.JobID = jobID
+	req.RequestedActions = []work.Action{work.ActionSmokeRun, work.ActionProfile}
+	if _, err := store.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	New(store, kube, "test-worker").WithVaultClient(vc).process(context.Background(), job)
+
+	stored, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	var l5a []capturedSubmission
+	for _, c := range captured {
+		if c.decodeCheck(t).Stage == vaultclient.StageL5A {
+			l5a = append(l5a, c)
+		}
+	}
+	return stored, l5a
+}
+
+// TestRunL5a_AmbiguousCreate_JobPersisted_Adopts is the L5-a counterpart of
+// the L4 case: the persisted L5-a Job is observed to completion, not reported
+// as a creation failure with its identity released while it runs.
+func TestRunL5a_AmbiguousCreate_JobPersisted_Adopts(t *testing.T) {
+	stored, l5a := runL5aWithFailedCreate(t, "l5a-ambiguous-persisted", true)
+	if len(l5a) != 1 {
+		t.Fatalf("L5-a check records = %d, want 1", len(l5a))
+	}
+	if got := l5a[0].decodeCheck(t).ValidationStatus; got != "succeeded" {
+		t.Fatalf("L5-a ValidationStatus = %q, want succeeded from observing the persisted Job", got)
+	}
+	if !stored.ExecutionTerminal {
+		t.Error("identity should be released once the adopted L5-a Job reached a terminal condition")
+	}
+}
+
+// TestRunL5a_AmbiguousCreate_NotFound_StaysAdoptable: the L5-a Create outcome
+// is unknown and the Job is not found, so the identity must not be released.
+func TestRunL5a_AmbiguousCreate_NotFound_StaysAdoptable(t *testing.T) {
+	stored, _ := runL5aWithFailedCreate(t, "l5a-ambiguous-missing", false)
+	if stored.ExecutionTerminal {
+		t.Fatal("identity released after an L5-a create whose outcome is unknown")
+	}
+}
+
 func leaseAndMint(t *testing.T, store work.Store, jobID string) *work.Job {
+	t.Helper()
+	job := leaseFresh(t, store, jobID)
+	mintExecution(t, store, job)
+	return job
+}
+
+// leaseFresh creates and leases a smoke_run-only row without minting an
+// identity, so process mints one and performs a real Create.
+func leaseFresh(t *testing.T, store work.Store, jobID string) *work.Job {
 	t.Helper()
 	req := newSmokeRunOnlyJob()
 	req.JobID = jobID
@@ -450,6 +661,5 @@ func leaseAndMint(t *testing.T, store work.Store, jobID string) *work.Job {
 	if err != nil {
 		t.Fatalf("LeaseJob: %v", err)
 	}
-	mintExecution(t, store, job)
 	return job
 }
