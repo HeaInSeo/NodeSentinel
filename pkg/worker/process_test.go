@@ -663,7 +663,7 @@ func TestRunSmokeRun_CreateFails(t *testing.T) {
 	spec := buildSmokeJobSpec(job)
 	// adopted=false is required here: an adopted run skips Create entirely,
 	// so the creation failure this test asserts on would never happen.
-	result := w.runSmokeRun(context.Background(), nil, smokeNamespace, job, spec, false, true)
+	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, false, true)
 	if result.success {
 		t.Fatal("expected failure when job creation fails")
 	}
