@@ -547,7 +547,7 @@ func TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating(t *testing.
 	spec1 := buildSmokeJobSpec(job1)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel1()
-	result1 := w.runSmokeRun(ctx1, slog.Default(), smokeNamespace, job1, spec1, false)
+	result1 := w.runSmokeRun(ctx1, slog.Default(), smokeNamespace, job1, spec1, false, true)
 	if result1.success || !result1.retryable {
 		t.Fatalf("attempt 1: expected a retryable failure (Get error), got %+v", result1)
 	}
@@ -628,7 +628,7 @@ func TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating(t *testing.
 	// every Get from here on, simulating the K8s API recovering.
 	kube.PrependReactor("get", "jobs", alwaysCompleteReactor(smokeNamespace))
 
-	result2 := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job2, spec2, adopted2)
+	result2 := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job2, spec2, adopted2, true)
 	if !result2.success {
 		t.Fatalf("attempt 2 should have observed the adopted Job to completion, got: %+v", result2)
 	}
@@ -685,7 +685,7 @@ func TestRunSmokeRun_NotFoundDuringPoll_ReleasesExecution(t *testing.T) {
 	// Adopt a Job that is not in the cluster at all, so the first poll Get
 	// returns NotFound.
 	spec := buildSmokeJobSpec(job)
-	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, true)
+	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, true, true)
 	if result.success || !result.retryable {
 		t.Fatalf("a vanished Job should be a retryable failure, got %+v", result)
 	}

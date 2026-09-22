@@ -36,6 +36,12 @@ var (
 	heartbeatFrequency = time.Duration(heartbeatInterval) * time.Second
 	pollFrequency      = time.Duration(pollInterval) * time.Second
 	smokeRunDuration   = time.Duration(smokeRunTimeout) * time.Second
+
+	// deletionConfirmWait bounds how long a worker waits for a foreground
+	// delete to actually remove a Job — see deleteAndConfirmGone. It covers
+	// the default 30s Pod termination grace period and stays below
+	// leaseDuration, so the wait cannot by itself let the lease lapse.
+	deletionConfirmWait = 60 * time.Second
 )
 
 // WithVaultClient sets the NodeVault HTTP client used to submit L5 records.
@@ -158,6 +164,34 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		logger.Info("adopted in-flight execution from a previous attempt — observing, not re-creating")
 	}
 
+	// L5-a runs under the same execution identity as L4 (see l5aJobName), so
+	// when it will follow, the identity must stay non-terminal after L4 and
+	// is released by runL5a once its own Job has ended.
+	l5aFollows := plan.runL5a && w.vaultClient != nil
+
+	// An adopted execution may already be past L4: a previous attempt that
+	// died during L5-a leaves the L5-a Job running and the L4 Job deleted.
+	// Observing L4 would then find NotFound, release the identity and rerun
+	// L4 + L5-a under a new one beside the still-running L5-a Job. The L5-a
+	// Job is only ever created after L4 succeeded, so its existence is proof
+	// enough to go straight to L5-a and adopt it there.
+	if adopted && l5aFollows {
+		switch found, err := w.jobExists(ctx, smokeNamespace, l5aJobName(job)); {
+		case err != nil:
+			// State unknown — keep the identity adoptable and try again later.
+			decision := decideRetry(FailureClassTransientInfra, job, "get adopted L5-a Job: "+err.Error())
+			w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
+			w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "observe adopted execution", decision)
+			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+			w.incJobsFailed()
+			return
+		case found:
+			logger.Info("adopted execution is already in L5-a — skipping L3/L4 and observing the L5-a Job")
+			w.finishAfterL4(ctx, logger, job, plan, isL5ALast)
+			return
+		}
+	}
+
 	jobSpec := buildSmokeJobSpec(job)
 	ns := smokeNamespace
 
@@ -174,6 +208,11 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		logger.Info("L3 dry-run skipped: execution already admitted by the attempt that created it")
 	} else if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
 		logger.Warn("L3 dry-run failed", "err", err)
+		// This attempt minted the identity and never created a Job under it,
+		// so release it. Leaving it adoptable would make the next attempt skip
+		// both the dry-run and the Create, observe a Job that never existed,
+		// and spend a retry on the resulting NotFound.
+		w.markExecutionTerminal(ctx, logger, job.JobID)
 		decision := decideRetry(FailureClassTransientInfra, job, "L3 dry-run: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run", decision)
@@ -188,7 +227,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	smokeCtx, cancel := context.WithTimeout(ctx, smokeRunDuration)
 	defer cancel()
 
-	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec, adopted)
+	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec, adopted, !l5aFollows)
 	if !result.success {
 		decision := decideRetry(result.class, job, result.reason)
 		w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
@@ -202,6 +241,12 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		w.reportTerminalSuccess(ctx, logger, job, vaultclient.StageL4, "smoke-run")
 	}
 
+	w.finishAfterL4(ctx, logger, job, plan, isL5ALast)
+}
+
+// finishAfterL4 runs the optional L5 stages of a job whose L4 smoke-run has
+// succeeded and completes the job in the WorkStore.
+func (w *Worker) finishAfterL4(ctx context.Context, logger *slog.Logger, job *work.Job, plan stagePlan, isL5ALast bool) {
 	// L5-a and L5-b run after L4 success, gated by the plan resolved from
 	// job.RequestedActions above — NodeVault should only receive check/scan
 	// records for stages it actually requested (see
@@ -416,11 +461,15 @@ func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job)
 //     object is gone). markExecutionTerminal is called, releasing the
 //     identity so a later attempt may mint a fresh one.
 //   - The execution's state is unknown (a K8s API error, or ctx expiring
-//     mid-run). The identity is deliberately left non-terminal, so the next
-//     attempt adopts and re-observes this same Job instead of starting a
-//     second one alongside it.
+//     mid-run without the Job's removal being confirmed). The identity is
+//     deliberately left non-terminal, so the next attempt adopts and
+//     re-observes this same Job instead of starting a second one alongside it.
+//
+// releaseOnSuccess is false when more Kubernetes work (L5-a) will run under
+// the same identity after a successful smoke-run; that stage releases it.
 func (w *Worker) runSmokeRun(
-	ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job, adopted bool,
+	ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job,
+	adopted, releaseOnSuccess bool,
 ) outcome {
 	name := jobSpec.Name
 	if adopted {
@@ -460,13 +509,13 @@ func (w *Worker) runSmokeRun(
 		select {
 		case <-ctx.Done():
 			// Best-effort cleanup. The delete is what makes this execution
-			// non-running, so the identity is released only on a delete that
-			// actually succeeded — otherwise the Job may well still be
-			// executing and the next attempt must adopt it, not race it.
-			if err := w.deleteJob(context.Background(), ns, name); err == nil || apierrors.IsNotFound(err) {
+			// non-running, so the identity is released only once the Job is
+			// confirmed gone — otherwise the Job may well still be executing
+			// and the next attempt must adopt it, not race it.
+			if err := w.deleteAndConfirmGone(ns, name); err == nil {
 				w.markExecutionTerminal(context.Background(), logger, job.JobID)
 			} else {
-				logger.Warn("L4: could not delete smoke-run Job on context end — "+
+				logger.Warn("L4: smoke-run Job not confirmed gone on context end — "+
 					"leaving execution adoptable rather than risking a duplicate", "k8s_job", name, "err", err)
 			}
 			return classifySmokeRun(ctx, w.kube, ns, name, &batchv1.Job{})
@@ -494,7 +543,9 @@ func (w *Worker) runSmokeRun(
 			}
 			for _, cond := range k8sJob.Status.Conditions {
 				if cond.Type == "Complete" && cond.Status == "True" {
-					w.markExecutionTerminal(ctx, logger, job.JobID)
+					if releaseOnSuccess {
+						w.markExecutionTerminal(ctx, logger, job.JobID)
+					}
 					_ = w.deleteJob(context.Background(), ns, name)
 					return outcome{success: true}
 				}
@@ -611,6 +662,46 @@ func (w *Worker) incL5bErrors() {
 func (w *Worker) incFailureClassified(class FailureClass, stage string) {
 	if w.metrics != nil {
 		w.metrics.IncFailureClassified(string(class), stage)
+	}
+}
+
+// deleteAndConfirmGone deletes Job name and waits, up to deletionConfirmWait,
+// until it is observed NotFound. A nil error from a foreground Delete only
+// means the request was accepted: the Job stays (terminating) until its Pods
+// are gone, and those Pods may still be executing during their grace period.
+// Only the Job's absence shows that nothing of this execution still runs.
+func (w *Worker) deleteAndConfirmGone(ns, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), deletionConfirmWait)
+	defer cancel()
+	if err := w.deleteJob(ctx, ns, name); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete Job %s: %w", name, err)
+	}
+	tick := time.NewTicker(pollFrequency)
+	defer tick.Stop()
+	for {
+		found, err := w.jobExists(ctx, ns, name)
+		if err == nil && !found {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("job %s still present after delete: %w", name, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// jobExists reports whether Job name exists. A non-NotFound API error is
+// returned as-is: the caller cannot tell either way.
+func (w *Worker) jobExists(ctx context.Context, ns, name string) (bool, error) {
+	_, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err):
+		return false, nil
+	default:
+		return false, err
 	}
 }
 

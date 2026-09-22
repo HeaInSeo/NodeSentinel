@@ -128,6 +128,10 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		created = jobSpec
 	case err != nil:
 		logger.Warn("L5-a job creation failed", "err", err)
+		// Nothing runs under this identity any more: L4 has finished and the
+		// L5-a Job was never created. process() left the identity open for
+		// L5-a (see l5aFollows), so release it here.
+		w.markExecutionTerminal(ctx, logger, job.JobID)
 		w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, err.Error())
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
 			outcome{class: FailureClassTransientInfra, reason: "infra-level: job creation failed: " + err.Error()}))
@@ -137,7 +141,7 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 
 	exitCode, result, runErr := w.waitL5aJob(l5aCtx, logger, job, created.Name)
 	durationSec := int64(time.Since(startedAt).Seconds())
-	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil {
+	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil && !apierrors.IsNotFound(delErr) {
 		logger.Warn("L5-a: failed to delete K8s Job — TTL will clean up",
 			"job", created.Name, "err", delErr)
 	}
@@ -214,6 +218,12 @@ func l5aFailureSubmission(checkID, command string, terminal bool, exitCode int, 
 // onto classifyFromPods both removes the duplication and fixes the bug (L5-a
 // now detects OOM specifically, routing it through
 // FailureClassResourceObservation instead of a blanket infra_failed).
+//
+// The L5-a Job is the last Kubernetes work under job's execution identity,
+// so this also releases that identity — with the same rule runSmokeRun
+// follows: only once the Job is known not to be running (a terminal
+// condition, or removal confirmed after a timeout). On a Get error the
+// identity is left adoptable.
 func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.Job, jobName string) (int, outcome, error) {
 	pollTick := time.NewTicker(pollFrequency)
 	heartbeatTick := time.NewTicker(heartbeatFrequency)
@@ -223,6 +233,12 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 	for {
 		select {
 		case <-ctx.Done():
+			if err := w.deleteAndConfirmGone(smokeNamespace, jobName); err == nil {
+				w.markExecutionTerminal(context.Background(), logger, job.JobID)
+			} else {
+				logger.Warn("L5-a: validation Job not confirmed gone after timeout — "+
+					"leaving execution adoptable rather than risking a duplicate", "k8s_job", jobName, "err", err)
+			}
 			result := outcome{class: FailureClassTransientInfra, reason: "L5-a timeout: job did not complete within allotted time"}
 			return 0, result, errors.New(result.reason)
 		case <-heartbeatTick.C:
@@ -238,10 +254,12 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 			for _, cond := range k8sJob.Status.Conditions {
 				switch {
 				case cond.Type == "Complete" && cond.Status == "True":
+					w.markExecutionTerminal(ctx, logger, job.JobID)
 					return 0, outcome{success: true}, nil
 				case cond.Type == "Failed" && cond.Status == "True":
 					result := classifyFromPods(ctx, w.kube, smokeNamespace, jobName, cond.Reason, cond.Message)
 					code := w.extractPodExitCode(ctx, jobName)
+					w.markExecutionTerminal(ctx, logger, job.JobID)
 					return code, result, fmt.Errorf("job failed: %s", cond.Message)
 				}
 			}

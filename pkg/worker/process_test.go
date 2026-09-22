@@ -30,13 +30,16 @@ func useFastWorkerTicks(t *testing.T) {
 	originalPoll := pollFrequency
 	originalHeartbeat := heartbeatFrequency
 	originalSmokeRun := smokeRunDuration
+	originalDeletionConfirm := deletionConfirmWait
 	pollFrequency = time.Millisecond
 	heartbeatFrequency = time.Millisecond
 	smokeRunDuration = 100 * time.Millisecond
+	deletionConfirmWait = 50 * time.Millisecond
 	t.Cleanup(func() {
 		pollFrequency = originalPoll
 		heartbeatFrequency = originalHeartbeat
 		smokeRunDuration = originalSmokeRun
+		deletionConfirmWait = originalDeletionConfirm
 	})
 }
 
@@ -635,7 +638,7 @@ func TestRunSmokeRun_Complete(t *testing.T) {
 	defer cancel()
 
 	// adopted=false: this test drives the create path.
-	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false)
+	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false, true)
 	if !result.success {
 		t.Errorf("expected success, got failure: %s", result.reason)
 	}
@@ -660,7 +663,7 @@ func TestRunSmokeRun_CreateFails(t *testing.T) {
 	spec := buildSmokeJobSpec(job)
 	// adopted=false is required here: an adopted run skips Create entirely,
 	// so the creation failure this test asserts on would never happen.
-	result := w.runSmokeRun(context.Background(), nil, smokeNamespace, job, spec, false)
+	result := w.runSmokeRun(context.Background(), nil, smokeNamespace, job, spec, false, true)
 	if result.success {
 		t.Fatal("expected failure when job creation fails")
 	}
@@ -693,7 +696,7 @@ func TestRunSmokeRun_GetFails(t *testing.T) {
 	defer cancel()
 
 	// adopted=false: the Job is created here, then polling fails.
-	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false)
+	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false, true)
 	if result.success {
 		t.Fatal("expected failure when Get fails")
 	}
