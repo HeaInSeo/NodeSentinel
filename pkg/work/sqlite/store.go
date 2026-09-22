@@ -170,16 +170,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 // migrateExecutionIdentity adds the execution_id/execution_terminal columns
 // (see work.Job.ExecutionID / Store.EnsureExecution) to a jobs table created
 // before this migration existed, following the same one-transaction
-// check-then-ALTER pattern as migrateResultDelivery — see its doc comment
-// for why a plain autocommit ALTER would race across connections.
-//
-// Pre-existing rows migrate to execution_id='' / execution_terminal=0, which
-// EnsureExecution reads as "no execution has been minted yet" (it keys off
-// the ID being empty, not off the terminal flag). That is the correct and
-// safe reading for a row written before this column existed: such a row's
-// K8s Job — if any survived the upgrade — was named from the old
-// attempt-derived scheme, so there is no ID here to adopt, and the next
-// attempt mints a fresh one.
+// check-then-ALTER pattern as migrateResultDelivery. See that doc comment for
+// why a plain autocommit ALTER would race across connections.
+// Pre-existing rows migrate to an empty execution_id with execution_terminal
+// unset, which EnsureExecution reads as "no execution has been minted yet"
+// (it keys off the ID being empty, not off the terminal flag). That is the
+// correct and safe reading for a row written before this column existed: such
+// a row's K8s Job, if any survived the upgrade, was named from the old
+// attempt-derived scheme, so there is no ID here to adopt and the next attempt
+// mints a fresh one.
 func (s *Store) migrateExecutionIdentity(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -900,7 +899,11 @@ WHERE job_id = ? AND terminal_submitted = 0
 // attempt — deriving identity from attempt is precisely the bug this
 // replaces (see work.Store.EnsureExecution), so nothing may key off that
 // segment.
-func (s *Store) EnsureExecution(ctx context.Context, jobID, worker string) (string, bool, error) {
+// The worker name is accepted to match work.Store.EnsureExecution (callers
+// pass their own identity) but is deliberately not persisted: an execution
+// identity belongs to the job, not to whichever worker happened to mint it,
+// and the current lease holder is already recorded separately as lease_owner.
+func (s *Store) EnsureExecution(ctx context.Context, jobID, _ string) (string, bool, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return "", false, fmt.Errorf("begin execution tx: %w", err)
