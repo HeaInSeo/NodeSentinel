@@ -10,6 +10,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
@@ -137,6 +138,24 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	// Terminal record was ever submitted for a successful smoke_run-only job.
 	isL4Last := !plan.runL5a && !plan.runL5b
 	isL5ALast := plan.runL5a && !plan.runL5b
+
+	// A row that has never had an execution identity may predate the
+	// execution_id column, and so may still have a Job running under the old
+	// attempt-derived name — one EnsureExecution cannot adopt. Retire any such
+	// Job before minting. This runs before EnsureExecution on purpose: if it
+	// fails, no identity is minted, so the next attempt still sees an empty
+	// ExecutionID and retries the retirement instead of skipping it.
+	if job.ExecutionID == "" {
+		if err := w.retireLegacyExecutions(ctx, logger, job); err != nil {
+			logger.Error("could not retire pre-execution-identity Jobs", "err", err)
+			decision := decideRetry(FailureClassTransientInfra, job, "retire legacy execution: "+err.Error())
+			w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
+			w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "retire legacy execution", decision)
+			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+			w.incJobsFailed()
+			return
+		}
+	}
 
 	// Establish this attempt's physical execution identity *before* building
 	// any Job spec. EnsureExecution either mints a new identity or hands back
@@ -558,6 +577,48 @@ func (w *Worker) runSmokeRun(
 			}
 		}
 	}
+}
+
+// retireLegacyExecutions deletes, and confirms gone, every Job in
+// smokeNamespace labelled with job's ID. It is only called for a row that has
+// never had an execution identity (see process), so any such Job was created
+// by a worker from before durable execution identities existed. Its name was
+// derived from the attempt number ("smoke-<id>-<attempt>" / "l5a-<id>-<attempt>"),
+// and it may still be running if that worker died and this attempt reclaimed
+// its expired lease. Minting a fresh identity beside it would start a second
+// concurrent execution of the same validation.
+//
+// Finished Jobs are deleted too. A legacy Job's result cannot be adopted,
+// because nothing records which attempt it belonged to. Deleting finished Jobs
+// also avoids relying on Job conditions to decide whether Pods still run.
+//
+// A job ID that is not a valid label value selects nothing. The API server
+// would have rejected a Job carrying it, so no legacy Job can exist.
+func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger, job *work.Job) error {
+	selector, selErr := labels.ValidatedSelectorFromSet(labels.Set{jobIDLabel: job.JobID})
+	if selErr != nil {
+		logger.Info("job ID is not a valid label value — no legacy Job can exist", "err", selErr)
+		return nil
+	}
+	list, err := w.kube.BatchV1().Jobs(smokeNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return fmt.Errorf("list Jobs for %s: %w", job.JobID, err)
+	}
+	for i := range list.Items {
+		name := list.Items[i].Name
+		logger.Warn("retiring Job left by a worker without execution identities", "k8s_job", name)
+		if delErr := w.deleteAndConfirmGone(smokeNamespace, name); delErr != nil {
+			return delErr
+		}
+		// Each confirmation can take up to deletionConfirmWait. Extend the
+		// lease so a slow retirement cannot let another worker reclaim the job.
+		if hbErr := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); hbErr != nil {
+			logger.Warn("Heartbeat failed", "err", hbErr)
+		}
+	}
+	return nil
 }
 
 // markExecutionTerminal releases jobID's execution identity, logging rather

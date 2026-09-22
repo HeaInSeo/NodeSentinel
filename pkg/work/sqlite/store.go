@@ -174,11 +174,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 // why a plain autocommit ALTER would race across connections.
 // Pre-existing rows migrate to an empty execution_id with execution_terminal
 // unset, which EnsureExecution reads as "no execution has been minted yet"
-// (it keys off the ID being empty, not off the terminal flag). That is the
-// correct and safe reading for a row written before this column existed: such
-// a row's K8s Job, if any survived the upgrade, was named from the old
-// attempt-derived scheme, so there is no ID here to adopt and the next attempt
-// mints a fresh one.
+// (it keys off the ID being empty, not off the terminal flag). There is no ID
+// to adopt for such a row, but minting one is not safe on its own: a leased or
+// running row may still have a Job running under the old attempt-derived
+// name, which a freshly minted identity would run beside. The worker retires
+// those Jobs before its first EnsureExecution for the row (see
+// pkg/worker's retireLegacyExecutions), so the store does not need to.
 func (s *Store) migrateExecutionIdentity(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

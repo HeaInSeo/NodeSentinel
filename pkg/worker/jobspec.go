@@ -21,6 +21,11 @@ const (
 	leaseTTL          = 2 * 60 // seconds; worker lease duration
 	heartbeatInterval = 30     // seconds; how often Heartbeat is called during L4
 	pollInterval      = 5      // seconds; LeaseJob polling interval
+
+	// jobIDLabel carries the WorkStore job ID on every Job this worker
+	// creates, under every naming scheme it has ever used — see
+	// retireLegacyExecutions, which relies on that.
+	jobIDLabel = "nodesentinel.io/job"
 )
 
 // buildSmokeJobSpec constructs the K8s Job object used for both the L3
@@ -39,8 +44,8 @@ func buildSmokeJobSpec(job *work.Job) *batchv1.Job {
 			Name:      smokeJobName(job),
 			Namespace: smokeNamespace,
 			Labels: map[string]string{
-				"app":                 "nodevault-smoke",
-				"nodesentinel.io/job": job.JobID,
+				"app":      "nodevault-smoke",
+				jobIDLabel: job.JobID,
 			},
 		},
 		Spec: batchv1.JobSpec{

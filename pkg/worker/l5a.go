@@ -62,8 +62,8 @@ func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 			Name:      l5aJobName(job),
 			Namespace: smokeNamespace,
 			Labels: map[string]string{
-				"app":                 "nodevault-l5a",
-				"nodesentinel.io/job": job.JobID,
+				"app":      "nodevault-l5a",
+				jobIDLabel: job.JobID,
 			},
 		},
 		Spec: batchv1.JobSpec{

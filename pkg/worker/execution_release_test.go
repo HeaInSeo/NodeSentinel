@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -300,6 +301,141 @@ func TestRunSmokeRun_Timeout_JobConfirmedGone_Releases(t *testing.T) {
 	}
 	if !stored.ExecutionTerminal {
 		t.Fatal("identity should be released once the deleted Job is confirmed gone")
+	}
+}
+
+// seedLegacyInFlightJob reproduces a row left behind by a worker from before
+// execution identities existed: that worker leased the row, created its Job
+// under the attempt-derived name, and died. The Job is still running (no
+// conditions) and the row has been requeued with an empty ExecutionID, just
+// as the migration leaves it. It returns the legacy Job's name.
+func seedLegacyInFlightJob(t *testing.T, store work.Store, kube *fake.Clientset, jobID string) string {
+	t.Helper()
+	req := newSmokeRunOnlyJob()
+	req.JobID = jobID
+	if _, err := store.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	legacy, err := store.LeaseJob(context.Background(), "legacy-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (legacy attempt): %v", err)
+	}
+	legacyName := fmt.Sprintf("smoke-%s-%d", jobID, legacy.Attempt)
+	legacyJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name:      legacyName,
+		Namespace: smokeNamespace,
+		Labels:    map[string]string{"app": "nodevault-smoke", jobIDLabel: jobID},
+	}}
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Create(
+		context.Background(), legacyJob, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("seed legacy Job: %v", err)
+	}
+	if err := store.FailJob(context.Background(), jobID, "legacy-worker", "lease expired", true); err != nil {
+		t.Fatalf("FailJob (requeue): %v", err)
+	}
+	kube.ClearActions()
+	return legacyName
+}
+
+// TestProcess_LegacyInFlightJob_RetiredBeforeNewExecution: an upgraded
+// worker reclaiming a row whose legacy Job is still running must delete that
+// Job, and see it gone, before it creates a Job under a fresh identity.
+// Otherwise two executions of one validation run at once.
+func TestProcess_LegacyInFlightJob_RetiredBeforeNewExecution(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	legacyName := seedLegacyInFlightJob(t, store, kube, "legacy-inflight")
+
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	// New-scheme Jobs complete at once. The legacy Job is left to the default
+	// tracker, so it reads NotFound only after it has really been deleted.
+	complete := alwaysCompleteReactor(smokeNamespace)
+	kube.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if ga, ok := action.(k8stesting.GetActionImpl); ok && ga.GetName() == legacyName {
+			return false, nil, nil
+		}
+		return complete(action)
+	})
+
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	if job.ExecutionID != "" {
+		t.Fatalf("setup: ExecutionID = %q, want empty as the migration leaves it", job.ExecutionID)
+	}
+	New(store, kube, "test-worker").process(context.Background(), job)
+
+	deletedAt, createdAt := -1, -1
+	for i, a := range kube.Actions() {
+		if da, ok := a.(k8stesting.DeleteActionImpl); ok && da.GetName() == legacyName && deletedAt < 0 {
+			deletedAt = i
+		}
+		if ca, ok := a.(k8stesting.CreateActionImpl); ok && len(ca.GetCreateOptions().DryRun) == 0 && createdAt < 0 {
+			createdAt = i
+		}
+	}
+	if deletedAt < 0 {
+		t.Fatalf("legacy Job %q was never deleted — it keeps running beside the new execution", legacyName)
+	}
+	if createdAt < 0 || createdAt < deletedAt {
+		t.Fatalf("new Job created at action %d, legacy Job deleted at action %d — want the delete first",
+			createdAt, deletedAt)
+	}
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(
+		context.Background(), legacyName, metav1.GetOptions{},
+	); !k8serrors.IsNotFound(err) {
+		t.Fatalf("legacy Job still present after processing (err=%v)", err)
+	}
+	final, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if final.Status != work.StatusSucceeded {
+		t.Fatalf("final Status = %q (LastError %q), want succeeded", final.Status, final.LastError)
+	}
+}
+
+// TestProcess_LegacyJobNotConfirmedGone_MintsNothing: if the legacy Job is
+// not confirmed gone, the attempt must requeue without minting an identity or
+// creating a Job. Minting would make the next attempt skip the retirement,
+// because it only runs for a row with an empty ExecutionID.
+func TestProcess_LegacyJobNotConfirmedGone_MintsNothing(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	seedLegacyInFlightJob(t, store, kube, "legacy-stuck")
+
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	// Accept every delete without removing anything, as with a Job whose Pods
+	// are still in their termination grace period.
+	kube.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil
+	})
+
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	New(store, kube, "test-worker").process(context.Background(), job)
+
+	if got := realJobCreates(kube); len(got) != 0 {
+		t.Fatalf("real Job creates = %v, want none while the legacy Job may still run", got)
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ExecutionID != "" {
+		t.Fatalf("ExecutionID = %q, want empty — a minted identity would skip the retirement on the next attempt",
+			stored.ExecutionID)
+	}
+	if stored.Status != work.StatusQueued {
+		t.Fatalf("Status = %q, want queued for a retry", stored.Status)
 	}
 }
 
