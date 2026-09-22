@@ -146,9 +146,9 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	// fails, no identity is minted, so the next attempt still sees an empty
 	// ExecutionID and retries the retirement instead of skipping it.
 	if job.ExecutionID == "" {
-		if err := w.retireLegacyExecutions(ctx, logger, job); err != nil {
-			logger.Error("could not retire pre-execution-identity Jobs", "err", err)
-			decision := decideRetry(FailureClassTransientInfra, job, "retire legacy execution: "+err.Error())
+		if retireErr := w.retireLegacyExecutions(ctx, logger, job); retireErr != nil {
+			logger.Error("could not retire pre-execution-identity Jobs", "err", retireErr)
+			decision := decideRetry(FailureClassTransientInfra, job, "retire legacy execution: "+retireErr.Error())
 			w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 			w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "retire legacy execution", decision)
 			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
@@ -580,7 +580,7 @@ func (w *Worker) runSmokeRun(
 }
 
 // retireLegacyExecutions deletes, and confirms gone, every Job in
-// smokeNamespace labelled with job's ID. It is only called for a row that has
+// smokeNamespace labeled with job's ID. It is only called for a row that has
 // never had an execution identity (see process), so any such Job was created
 // by a worker from before durable execution identities existed. Its name was
 // derived from the attempt number ("smoke-<id>-<attempt>" / "l5a-<id>-<attempt>"),
