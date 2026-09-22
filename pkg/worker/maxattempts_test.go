@@ -57,7 +57,11 @@ func TestProcess_L4OOM_NotRetried_MapsToObservedContractFailure(t *testing.T) {
 		t.Fatalf("LeaseJob: %v", err)
 	}
 
-	// Seed an OOMKilled container for the L4 smoke-run pod.
+	// Seed an OOMKilled container for the L4 smoke-run pod. The pod's
+	// "job-name" label has to match the K8s Job process() will observe, so
+	// the execution identity has to exist before the name is computed.
+	mintExecution(t, store, job)
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "smoke-oom-pod",
@@ -418,51 +422,97 @@ func TestHeadOfLine_PermanentlyFailingJob_DoesNotBlockLaterJobs(t *testing.T) {
 	}
 }
 
-// ── Principle 5: Job-name collision reproduction + fix confirmation ────────
+// ── Principle 5: Job naming — per-execution, NOT per-attempt ──────────────
 
-// TestSmokeJobName_UniquePerAttempt_Regression and
-// TestL5aJobName_UniquePerAttempt_Regression pin down the fix itself: the
-// K8s Job name must differ across attempts of the same WorkStore job.
-func TestSmokeJobName_UniquePerAttempt_Regression(t *testing.T) {
-	job := &work.Job{JobID: "abc123", Attempt: 1}
-	name1 := smokeJobName(job)
-	job.Attempt = 2
-	name2 := smokeJobName(job)
-	if name1 == name2 {
-		t.Fatalf("smokeJobName must differ across attempts (got %q for both) — see its doc comment for the "+
-			"AlreadyExists collision this prevents", name1)
+// TestJobName_KeyedOnExecutionNotAttempt_Regression pins the naming contract
+// both Job builders share, in the direction that actually matters.
+//
+// An earlier fix made these names unique *per attempt* to avoid an
+// AlreadyExists collision. That traded one bug for a worse one: LeaseJob
+// increments attempt when it reclaims a merely-expired lease, so a worker
+// that died without its K8s Job dying got a different name on the next
+// attempt and created a *second* Job beside the one still running — two
+// concurrent physical executions of one logical validation (issue #2).
+//
+// So attempt must NOT move the name, and the execution identity must.
+func TestJobName_KeyedOnExecutionNotAttempt_Regression(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*work.Job) string
+	}{
+		{"smoke", smokeJobName},
+		{"l5a", l5aJobName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &work.Job{JobID: "abc123", ExecutionID: "a1-0123456789abcdef", Attempt: 1}
+			before := tc.build(job)
+
+			// A reclaimed lease bumps attempt while adopting the same
+			// in-flight execution. The name must not budge, or the adopting
+			// attempt would address a different Job object and create a
+			// duplicate.
+			job.Attempt = 2
+			if after := tc.build(job); after != before {
+				t.Fatalf("name changed with attempt alone (%q -> %q): a reclaimed lease would "+
+					"create a second Job beside the one still running", before, after)
+			}
+
+			// A genuinely new execution — minted only once the previous one
+			// is terminal — must get its own name, or it would collide with
+			// the previous execution's leftover object.
+			job.ExecutionID = "a2-fedcba9876543210"
+			if after := tc.build(job); after == before {
+				t.Fatalf("name did not change with a new execution identity (%q): a fresh attempt "+
+					"would collide with the previous execution's leftover Job object", after)
+			}
+		})
 	}
 }
 
-func TestL5aJobName_UniquePerAttempt_Regression(t *testing.T) {
-	job := &work.Job{JobID: "abc123", Attempt: 1}
-	name1 := l5aJobName(job)
-	job.Attempt = 2
-	name2 := l5aJobName(job)
-	if name1 == name2 {
-		t.Fatalf("l5aJobName must differ across attempts (got %q for both)", name1)
+// TestSmokeJobName_FitsDNSLabelLimit guards the budget sanitizeDNSLabel
+// truncates against. K8s rejects an object name longer than 63 characters,
+// and the execution-identity suffix is substantially longer than the bare
+// attempt number it replaced — so the old 50-character allowance would have
+// overflowed and made every Job creation fail for a long job ID.
+func TestSmokeJobName_FitsDNSLabelLimit(t *testing.T) {
+	job := &work.Job{
+		JobID:       strings.Repeat("j", 200),
+		ExecutionID: "a9999-0123456789abcdef",
+	}
+	for _, name := range []string{smokeJobName(job), l5aJobName(job)} {
+		if len(name) > 63 {
+			t.Errorf("name %q is %d chars, exceeding the 63-character DNS label limit", name, len(name))
+		}
 	}
 }
 
-// TestRunSmokeRun_RetryAfterGetFailure_DoesNotCollideOnStaleJobObject
-// reproduces the exact non-crash sequence identified as a real (not just
-// crash-recovery) Job-name collision risk: attempt 1's poll-loop Get call
-// fails transiently, and runSmokeRun's Get-error branch returns without
-// deleting the K8s Job it just created (unlike the Complete/Failed/
-// ctx.Done() paths — see runSmokeRun and smokeJobName's doc comment).
-// Attempt 2 must still succeed at Create despite that stale object still
-// being present, because attempt-numbered names give it a different name.
-func TestRunSmokeRun_RetryAfterGetFailure_DoesNotCollideOnStaleJobObject(t *testing.T) {
+// TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating is the
+// core no-duplicate-execution regression for issue #2.
+//
+// It reproduces the exact non-crash sequence that used to produce two
+// concurrent executions: attempt 1's poll-loop Get fails transiently, and
+// runSmokeRun's Get-error branch returns without deleting the K8s Job it
+// created — the Job is still running, and its outcome was never observed.
+// The job is then requeued and re-leased.
+//
+// Under the old attempt-keyed naming, attempt 2 computed a *different* name
+// and created a second Job beside the first. Now attempt 2 must adopt
+// attempt 1's execution and observe that same Job — so the namespace must
+// still hold exactly one Job object for this logical validation.
+//
+// The one-object assertion is the point of the test. Asserting only that
+// attempt 2 succeeds would pass just as well under the duplicating behavior.
+func TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating(t *testing.T) {
 	useFastWorkerTicks(t)
 
 	kube := fake.NewClientset()
 	store := newTestStore(t)
 	w := New(store, kube, "test-worker")
 
-	job := &work.Job{
-		JobID:           "collision-repro-job",
-		ImageRepository: "harbor.example.com/library/bwa",
-		ImageDigest:     "sha256:abc123",
+	req := newSmokeRunOnlyJob()
+	req.JobID = "adoption-repro-job"
+	if _, err := store.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob: %v", err)
 	}
 
 	// getShouldFail toggles a prepended reactor on/off without ever removing
@@ -480,36 +530,172 @@ func TestRunSmokeRun_RetryAfterGetFailure_DoesNotCollideOnStaleJobObject(t *test
 		return false, nil, nil // fall through to the default tracker reactor
 	})
 
-	// Attempt 1: Get fails transiently.
-	job.Attempt = 1
-	spec1 := buildSmokeJobSpec(job)
+	// ── Attempt 1: lease, mint an execution, Get fails transiently ──────────
+	job1, err := store.LeaseJob(context.Background(), "worker-1", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (attempt 1): %v", err)
+	}
+	executionID1, adopted1, err := store.EnsureExecution(context.Background(), job1.JobID, "worker-1")
+	if err != nil {
+		t.Fatalf("EnsureExecution (attempt 1): %v", err)
+	}
+	if adopted1 {
+		t.Fatal("attempt 1 must mint a fresh execution, not adopt one")
+	}
+	job1.ExecutionID = executionID1
+
+	spec1 := buildSmokeJobSpec(job1)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel1()
-	result1 := w.runSmokeRun(ctx1, slog.Default(), smokeNamespace, job, spec1)
+	result1 := w.runSmokeRun(ctx1, slog.Default(), smokeNamespace, job1, spec1, false)
 	if result1.success || !result1.retryable {
 		t.Fatalf("attempt 1: expected a retryable failure (Get error), got %+v", result1)
 	}
 
-	// Confirm the scenario this test reproduces: attempt 1's Job object was
-	// never cleaned up. Let Get through to the real tracker to check.
+	// The scenario this reproduces: attempt 1's Job object is still there,
+	// still running as far as anyone knows. Let Get through to check.
 	getShouldFail.Store(false)
-	if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(context.Background(), spec1.Name, metav1.GetOptions{}); err != nil {
-		t.Fatalf("expected attempt 1's stale Job object to still exist (Get-error path skips cleanup), got: %v", err)
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(
+		context.Background(), spec1.Name, metav1.GetOptions{},
+	); err != nil {
+		t.Fatalf("expected attempt 1's Job to still exist (the Get-error path must not delete it): %v", err)
 	}
 
-	// Attempt 2: a fresh lease bumps Attempt — the Job name must differ, so
-	// Create must not collide with the leftover object from attempt 1.
-	job.Attempt = 2
-	spec2 := buildSmokeJobSpec(job)
-	if spec2.Name == spec1.Name {
-		t.Fatal("attempt 2's Job name must differ from attempt 1's")
+	// Because the outcome was never observed, the execution must have been
+	// left adoptable. Releasing it here is what would let attempt 2 mint a
+	// new identity and start a duplicate.
+	stored, err := store.GetJob(context.Background(), job1.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
 	}
+	if stored.ExecutionTerminal {
+		t.Fatal("execution was marked terminal despite its outcome never being observed — " +
+			"the next attempt would mint a new identity and run a second Job alongside this one")
+	}
+
+	// Requeue exactly as process() does after a retryable outcome. This step
+	// is what production performs between the two attempts, and it is load-
+	// bearing here: LeaseJob only hands out a job that is 'queued', or one
+	// whose lease has actually expired. Attempt 1's lease still has ~60s to
+	// run, so without this the re-lease below would come back
+	// ErrNoAvailableJob and the test would never reach the duplicate-Job
+	// assertion it exists for.
+	if err := store.FailJob(
+		context.Background(), job1.JobID, "worker-1", result1.reason, true,
+	); err != nil {
+		t.Fatalf("FailJob (requeue after attempt 1): %v", err)
+	}
+
+	// Requeuing must not have released the execution identity — only an
+	// observed terminal outcome may do that. If it had, attempt 2 would mint
+	// a new one and start a duplicate.
+	requeued, err := store.GetJob(context.Background(), job1.JobID)
+	if err != nil {
+		t.Fatalf("GetJob after requeue: %v", err)
+	}
+	if requeued.ExecutionTerminal {
+		t.Fatal("requeuing a job must not mark its execution terminal — the Job is still running")
+	}
+
+	// ── Attempt 2: a different worker reclaims the lease ────────────────────
+	job2, err := store.LeaseJob(context.Background(), "worker-2", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (attempt 2): %v", err)
+	}
+	if job2.Attempt == job1.Attempt {
+		t.Fatalf("attempt did not advance on re-lease (%d) — this test would not be exercising a retry",
+			job2.Attempt)
+	}
+	executionID2, adopted2, err := store.EnsureExecution(context.Background(), job2.JobID, "worker-2")
+	if err != nil {
+		t.Fatalf("EnsureExecution (attempt 2): %v", err)
+	}
+	if !adopted2 {
+		t.Fatal("attempt 2 must adopt attempt 1's in-flight execution, not mint a new one")
+	}
+	if executionID2 != executionID1 {
+		t.Fatalf("adopted execution id = %q, want attempt 1's %q", executionID2, executionID1)
+	}
+	job2.ExecutionID = executionID2
+
+	spec2 := buildSmokeJobSpec(job2)
+	if spec2.Name != spec1.Name {
+		t.Fatalf("attempt 2 addresses Job %q but attempt 1 created %q — it would create a duplicate",
+			spec2.Name, spec1.Name)
+	}
+
 	// Prepended on top of the toggleable reactor above — takes priority for
 	// every Get from here on, simulating the K8s API recovering.
 	kube.PrependReactor("get", "jobs", alwaysCompleteReactor(smokeNamespace))
 
-	result2 := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec2)
+	result2 := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job2, spec2, adopted2)
 	if !result2.success {
-		t.Fatalf("attempt 2 should succeed without a Job-name collision, got: %+v", result2)
+		t.Fatalf("attempt 2 should have observed the adopted Job to completion, got: %+v", result2)
+	}
+
+	// The assertion this test exists for: at no point did a second physical
+	// execution of this logical validation exist.
+	jobs, err := kube.BatchV1().Jobs(smokeNamespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs.Items) > 1 {
+		names := make([]string, 0, len(jobs.Items))
+		for _, item := range jobs.Items {
+			names = append(names, item.Name)
+		}
+		t.Fatalf("found %d concurrent K8s Jobs for one logical validation (%v) — "+
+			"duplicate physical execution, which issue #2 forbids", len(jobs.Items), names)
+	}
+
+	// Having observed a terminal outcome, the execution must now be released
+	// so a later retry is free to mint a fresh identity.
+	final, err := store.GetJob(context.Background(), job2.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if !final.ExecutionTerminal {
+		t.Error("execution should be marked terminal once its outcome was observed")
+	}
+}
+
+// TestRunSmokeRun_NotFoundDuringPoll_ReleasesExecution covers the other
+// direction: a Job that has vanished (TTL-reaped, or deleted out from under
+// the worker) is definitively not running, so its identity must be released
+// rather than left adoptable. Leaving it adoptable would strand the job —
+// every later attempt would try to observe a Job that no longer exists.
+func TestRunSmokeRun_NotFoundDuringPoll_ReleasesExecution(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	store := newTestStore(t)
+	w := New(store, kube, "test-worker")
+
+	req := newSmokeRunOnlyJob()
+	req.JobID = "vanished-job-repro"
+	if _, err := store.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	mintExecution(t, store, job)
+
+	// Adopt a Job that is not in the cluster at all, so the first poll Get
+	// returns NotFound.
+	spec := buildSmokeJobSpec(job)
+	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, true)
+	if result.success || !result.retryable {
+		t.Fatalf("a vanished Job should be a retryable failure, got %+v", result)
+	}
+
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if !stored.ExecutionTerminal {
+		t.Fatal("a Job observed NotFound is definitively not running — its execution identity must be " +
+			"released, or every later attempt would keep adopting a Job that does not exist")
 	}
 }

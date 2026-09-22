@@ -137,6 +137,19 @@ type Job struct {
 	// requeued/retried job re-reaching the point where it would otherwise
 	// submit another terminal record).
 	TerminalSubmitted bool
+
+	// ExecutionID names this job's current *physical* execution — the
+	// identity the K8s Job object carries (see pkg/worker's smokeJobName).
+	// It is deliberately NOT derived from Attempt: see EnsureExecution for
+	// the concurrent-duplicate-execution bug that derivation caused.
+	// Empty until the job's first execution is minted.
+	ExecutionID string
+
+	// ExecutionTerminal reports whether ExecutionID's physical execution has
+	// been observed to reach a terminal state (Complete/Failed), or to no
+	// longer exist at all. Only then may a new attempt mint a new
+	// ExecutionID — see EnsureExecution.
+	ExecutionTerminal bool
 }
 
 type Store interface {
@@ -174,6 +187,47 @@ type Store interface {
 	// therefore never claim the same job — see pkg/work/sqlite's
 	// _txlock=immediate DSN option. Returns oldest-updated first.
 	ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL time.Duration) ([]*Job, error)
+
+	// EnsureExecution returns the execution identity (see Job.ExecutionID)
+	// the caller must use for jobID's physical K8s Job on this attempt, and
+	// whether that identity was *adopted* from a previous attempt rather
+	// than freshly minted.
+	//
+	// This exists to close a concurrent-duplicate-execution hole. The K8s
+	// Job name used to be derived from Job.Attempt, and LeaseJob increments
+	// attempt on *every* lease — including when it reclaims a lease that
+	// merely expired (see LeaseJob's 'running' reclaim clause). So a worker
+	// that stopped heartbeating without its K8s Job stopping — a crashed,
+	// evicted, or network-partitioned worker, or simply a Pod replacement
+	// mid-run — left its smoke-run Job still executing in the cluster while
+	// the next lease computed a *different* name and created a second Job.
+	// Two physical executions of one logical validation then ran at once,
+	// which is exactly what NodeSentinel #2's acceptance forbids.
+	//
+	// Contract:
+	//   - If jobID already has an ExecutionID whose execution is not yet
+	//     terminal, that same ID is returned with adopted=true. The caller
+	//     must then *observe* the existing K8s Job rather than create one.
+	//   - Otherwise a new ID is minted, persisted, marked non-terminal, and
+	//     returned with adopted=false — the caller creates the Job.
+	//
+	// A new execution is therefore only ever minted after the previous one
+	// is terminal (MarkExecutionTerminal) and the retry policy separately
+	// allowed the requeue that produced this lease. Returns ErrNotFound if
+	// jobID does not exist.
+	EnsureExecution(ctx context.Context, jobID, worker string) (executionID string, adopted bool, err error)
+
+	// MarkExecutionTerminal records that jobID's current ExecutionID has
+	// reached a terminal state — it completed, failed, or was observed to no
+	// longer exist. It is the only thing that re-enables minting a new
+	// execution identity on a later attempt (see EnsureExecution).
+	//
+	// Callers must only invoke this once the physical execution is known not
+	// to be running: a Complete/Failed Job condition, or a NotFound on the
+	// Job object itself. Calling it while the Job may still be running would
+	// reopen the duplicate-execution hole EnsureExecution closes. Returns
+	// ErrNotFound if jobID does not exist.
+	MarkExecutionTerminal(ctx context.Context, jobID string) error
 
 	// ClaimTerminal atomically claims jobID's one-time terminal-submission
 	// slot: the first caller for a given job gets claimed=true and is the

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -131,6 +132,32 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	isL4Last := !plan.runL5a && !plan.runL5b
 	isL5ALast := plan.runL5a && !plan.runL5b
 
+	// Establish this attempt's physical execution identity *before* building
+	// any Job spec. EnsureExecution either mints a new identity or hands back
+	// the one a previous attempt left in flight; in the latter case this
+	// attempt must observe that execution instead of starting a second one.
+	// See work.Store.EnsureExecution for the concurrent-duplicate-execution
+	// bug this replaces.
+	executionID, adopted, err := w.store.EnsureExecution(ctx, job.JobID, w.workerName)
+	if err != nil {
+		// Without a durable identity there is no safe name to run under:
+		// falling back to an attempt-derived one is what allowed duplicate
+		// concurrent executions. Requeue instead (retryable — a store error
+		// here is infrastructural) and let a later lease try again.
+		logger.Error("could not establish execution identity", "err", err)
+		decision := decideRetry(FailureClassTransientInfra, job, "execution identity: "+err.Error())
+		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
+		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "ensure execution identity", decision)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+		w.incJobsFailed()
+		return
+	}
+	job.ExecutionID = executionID
+	logger = logger.With("execution_id", executionID)
+	if adopted {
+		logger.Info("adopted in-flight execution from a previous attempt — observing, not re-creating")
+	}
+
 	jobSpec := buildSmokeJobSpec(job)
 	ns := smokeNamespace
 
@@ -138,7 +165,14 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	// is always classified TransientInfra (admission webhook / API server
 	// issue) — see decideRetry for how repeated failures are eventually
 	// bounded by maxAttempts instead of retrying forever.
-	if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
+	//
+	// Skipped entirely when this attempt adopted an in-flight execution: the
+	// attempt that created that execution already passed admission for this
+	// exact spec, and a dry-run Create against a name that now exists for
+	// real would come back AlreadyExists and fail the job for no reason.
+	if adopted {
+		logger.Info("L3 dry-run skipped: execution already admitted by the attempt that created it")
+	} else if err := w.runDryRun(ctx, ns, jobSpec); err != nil {
 		logger.Warn("L3 dry-run failed", "err", err)
 		decision := decideRetry(FailureClassTransientInfra, job, "L3 dry-run: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
@@ -146,14 +180,15 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
 		w.incJobsFailed()
 		return
+	} else {
+		logger.Info("L3 dry-run passed")
 	}
-	logger.Info("L3 dry-run passed")
 
 	// L4: real smoke-run.
 	smokeCtx, cancel := context.WithTimeout(ctx, smokeRunDuration)
 	defer cancel()
 
-	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec)
+	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec, adopted)
 	if !result.success {
 		decision := decideRetry(result.class, job, result.reason)
 		w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
@@ -371,13 +406,49 @@ func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job)
 	return err
 }
 
-func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job) outcome {
-	created, err := w.kube.BatchV1().Jobs(ns).Create(ctx, jobSpec, metav1.CreateOptions{})
-	if err != nil {
-		return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
-			reason: "failed to create smoke-run Job: " + err.Error()}
+// runSmokeRun runs — or, when adopted is true, observes — the one physical
+// smoke-run execution named by jobSpec.
+//
+// Every return path here falls into exactly one of two categories, and the
+// distinction is what keeps at most one execution alive per logical job:
+//
+//   - The execution is known not to be running (Complete, Failed, or the Job
+//     object is gone). markExecutionTerminal is called, releasing the
+//     identity so a later attempt may mint a fresh one.
+//   - The execution's state is unknown (a K8s API error, or ctx expiring
+//     mid-run). The identity is deliberately left non-terminal, so the next
+//     attempt adopts and re-observes this same Job instead of starting a
+//     second one alongside it.
+func (w *Worker) runSmokeRun(
+	ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job, adopted bool,
+) outcome {
+	name := jobSpec.Name
+	if adopted {
+		logger.Info("L4 observing adopted smoke-run Job", "k8s_job", name)
+	} else {
+		created, err := w.kube.BatchV1().Jobs(ns).Create(ctx, jobSpec, metav1.CreateOptions{})
+		switch {
+		case apierrors.IsAlreadyExists(err):
+			// The object exists under this execution's own name — this worker
+			// minted the identity and then died between the mint and a
+			// successful Create record, or is retrying the Create itself.
+			// Either way the existing object *is* this execution, so observe
+			// it. Creating a differently-named Job here is what produced
+			// concurrent duplicates before.
+			logger.Info("L4 smoke-run Job already exists — adopting", "k8s_job", name)
+		case err != nil:
+			// Creation failed, so nothing is running under this identity.
+			// Release it rather than stranding the job: leaving it
+			// non-terminal would make every later attempt try to adopt a Job
+			// that was never created.
+			w.markExecutionTerminal(ctx, logger, job.JobID)
+			return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+				reason: "failed to create smoke-run Job: " + err.Error()}
+		default:
+			name = created.Name
+			logger.Info("L4 smoke-run Job created", "k8s_job", name)
+		}
 	}
-	logger.Info("L4 smoke-run Job created", "k8s_job", created.Name)
 
 	// Poll until Job completes, context expires, or deadline exceeds.
 	pollTick := time.NewTicker(pollFrequency)
@@ -388,31 +459,66 @@ func (w *Worker) runSmokeRun(ctx context.Context, logger *slog.Logger, ns string
 	for {
 		select {
 		case <-ctx.Done():
-			// Best-effort cleanup.
-			_ = w.deleteJob(context.Background(), ns, created.Name)
-			return classifySmokeRun(ctx, w.kube, ns, created.Name, &batchv1.Job{})
+			// Best-effort cleanup. The delete is what makes this execution
+			// non-running, so the identity is released only on a delete that
+			// actually succeeded — otherwise the Job may well still be
+			// executing and the next attempt must adopt it, not race it.
+			if err := w.deleteJob(context.Background(), ns, name); err == nil || apierrors.IsNotFound(err) {
+				w.markExecutionTerminal(context.Background(), logger, job.JobID)
+			} else {
+				logger.Warn("L4: could not delete smoke-run Job on context end — "+
+					"leaving execution adoptable rather than risking a duplicate", "k8s_job", name, "err", err)
+			}
+			return classifySmokeRun(ctx, w.kube, ns, name, &batchv1.Job{})
 		case <-heartbeatTick.C:
 			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
 				logger.Warn("Heartbeat failed", "err", err)
 			}
 		case <-pollTick.C:
-			k8sJob, err := w.kube.BatchV1().Jobs(ns).Get(ctx, created.Name, metav1.GetOptions{})
+			k8sJob, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				// The Job is definitively gone — TTL-reaped, or deleted out
+				// from under us. Nothing is running, so release the identity
+				// and let the next attempt mint a fresh one. Retryable
+				// because no outcome was ever observed for this execution.
+				w.markExecutionTerminal(ctx, logger, job.JobID)
+				return outcome{success: false, retryable: true, class: FailureClassUnknown,
+					reason: "smoke-run Job no longer exists; outcome was never observed"}
+			}
 			if err != nil {
+				// State unknown — the Job may still be running. Leave the
+				// identity adoptable so the next attempt re-observes this
+				// same execution instead of creating a second one.
 				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
 					reason: "get smoke-run Job: " + err.Error()}
 			}
 			for _, cond := range k8sJob.Status.Conditions {
 				if cond.Type == "Complete" && cond.Status == "True" {
-					_ = w.deleteJob(context.Background(), ns, created.Name)
+					w.markExecutionTerminal(ctx, logger, job.JobID)
+					_ = w.deleteJob(context.Background(), ns, name)
 					return outcome{success: true}
 				}
 				if cond.Type == "Failed" && cond.Status == "True" {
-					result := classifySmokeRun(ctx, w.kube, ns, created.Name, k8sJob)
-					_ = w.deleteJob(context.Background(), ns, created.Name)
+					result := classifySmokeRun(ctx, w.kube, ns, name, k8sJob)
+					w.markExecutionTerminal(ctx, logger, job.JobID)
+					_ = w.deleteJob(context.Background(), ns, name)
 					return result
 				}
 			}
 		}
+	}
+}
+
+// markExecutionTerminal releases jobID's execution identity, logging rather
+// than propagating a store failure: every caller is already on a path that
+// returns its own outcome, and a failure here is self-correcting — the
+// identity simply stays adoptable, so the next attempt re-observes a Job
+// that has already finished and reaches the same terminal conclusion. That
+// is the safe direction to fail in; the unsafe direction would be releasing
+// an identity whose Job is still running.
+func (w *Worker) markExecutionTerminal(ctx context.Context, logger *slog.Logger, jobID string) {
+	if err := w.store.MarkExecutionTerminal(ctx, jobID); err != nil {
+		logger.Warn("could not mark execution terminal — it stays adoptable for the next attempt", "err", err)
 	}
 }
 

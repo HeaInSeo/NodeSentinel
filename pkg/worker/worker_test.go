@@ -84,6 +84,33 @@ func fakeJobWithCondition(ns, name string, condType batchv1.JobConditionType, st
 	}
 }
 
+// mintExecution establishes job's durable execution identity up front and
+// copies it onto job, so a test can compute the K8s Job name (smokeJobName /
+// l5aJobName) *before* calling w.process — which it must, to seed a Pod
+// carrying the matching "job-name" label.
+//
+// The name is no longer predictable from the job ID and attempt alone: it
+// embeds a random execution identity (see work.Store.EnsureExecution), which
+// is exactly what stops a reclaimed lease from starting a second concurrent
+// execution. Pre-minting here is not a workaround for that — process() calls
+// EnsureExecution itself and, finding this identity in flight, adopts the
+// same one, which is the real code path a re-leased job takes.
+//
+// Consequence worth knowing when reading these tests: an adopted execution
+// skips the L3 dry-run and the L4 Create (see process), since the attempt
+// that minted the identity already did both. Tests that pin L4/L5-a
+// *classification* are unaffected; a test that needs the create path must
+// let process() mint the identity instead of calling this.
+func mintExecution(t *testing.T, store work.Store, job *work.Job) {
+	t.Helper()
+
+	executionID, _, err := store.EnsureExecution(context.Background(), job.JobID, "test-worker")
+	if err != nil {
+		t.Fatalf("EnsureExecution: %v", err)
+	}
+	job.ExecutionID = executionID
+}
+
 // TestL3DryRun_SendsDryRunAll verifies runDryRun passes DryRun:All in the
 // CreateOptions (fake client doesn't enforce dry-run, so we inspect the action).
 func TestL3DryRun_SendsDryRunAll(t *testing.T) {

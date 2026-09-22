@@ -10,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
@@ -21,11 +22,15 @@ const (
 	l5aCommand    = "/bin/sh -c true" // minimal: image must start and exit 0
 )
 
-// l5aJobName returns a DNS-safe Job name for the L5-a validation run,
-// suffixed with job.Attempt for the same reason smokeJobName is — see its
-// doc comment for the collision this avoids.
+// l5aJobName returns a DNS-safe Job name for the L5-a validation run, keyed
+// on the job's durable execution identity for the same reason smokeJobName
+// is — see its doc comment for both the AlreadyExists collision and the
+// concurrent-duplicate-execution hole this naming avoids. L5-a runs inside
+// the same leased execution as the L4 smoke-run it follows, so it shares
+// that execution's identity; the distinct "l5a-" prefix keeps the two Job
+// objects from colliding with each other.
 func l5aJobName(job *work.Job) string {
-	return fmt.Sprintf("l5a-%s-%d", sanitizeDNSLabel(job.JobID), job.Attempt)
+	return fmt.Sprintf("l5a-%s-%s", sanitizeDNSLabel(job.JobID), job.ExecutionID)
 }
 
 // l5aCommandSlice returns the Command slice used in the K8s Job spec.
@@ -110,13 +115,25 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 	defer cancel()
 
 	created, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(l5aCtx, jobSpec, metav1.CreateOptions{})
-	if err != nil {
+	switch {
+	case apierrors.IsAlreadyExists(err):
+		// This execution's L5-a Job is already in the cluster — a previous
+		// worker created it and stopped heartbeating before deleting it, and
+		// this attempt adopted the same execution identity (see
+		// work.Store.EnsureExecution). Observe that Job rather than treating
+		// its existence as a creation failure; creating a second one is both
+		// impossible under this name and, as a differently-named Job, exactly
+		// the duplicate execution the identity scheme exists to prevent.
+		logger.Info("L5-a validation Job already exists — adopting", "k8s_job", jobSpec.Name)
+		created = jobSpec
+	case err != nil:
 		logger.Warn("L5-a job creation failed", "err", err)
 		w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, err.Error())
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
 			outcome{class: FailureClassTransientInfra, reason: "infra-level: job creation failed: " + err.Error()}))
+	default:
+		logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 	}
-	logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 
 	exitCode, result, runErr := w.waitL5aJob(l5aCtx, logger, job, created.Name)
 	durationSec := int64(time.Since(startedAt).Seconds())
