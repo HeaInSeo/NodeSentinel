@@ -123,7 +123,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		decision := decideRetry(FailureClassDeterministic, job, "invalid requested_actions: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "validate requested_actions", decision)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 		w.incJobsFailed()
 		return
 	}
@@ -152,7 +152,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 			decision := decideRetry(FailureClassTransientInfra, job, "retire legacy execution: "+retireErr.Error())
 			w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 			w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "retire legacy execution", decision)
-			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 			w.incJobsFailed()
 			return
 		}
@@ -174,7 +174,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		decision := decideRetry(FailureClassTransientInfra, job, "execution identity: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "ensure execution identity", decision)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 		w.incJobsFailed()
 		return
 	}
@@ -202,7 +202,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 			decision := decideRetry(FailureClassTransientInfra, job, "get adopted L5-a Job: "+err.Error())
 			w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
 			w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "observe adopted execution", decision)
-			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+			_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 			w.incJobsFailed()
 			return
 		case found:
@@ -236,7 +236,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		decision := decideRetry(FailureClassTransientInfra, job, "L3 dry-run: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run", decision)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 		w.incJobsFailed()
 		return
 	} else {
@@ -252,7 +252,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		decision := decideRetry(result.class, job, result.reason)
 		w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL4, "smoke-run", decision)
-		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry)
+		_ = w.store.FailJob(ctx, job.JobID, w.workerName, decision.Reason, decision.Retry, decision.Delay)
 		w.incJobsFailed()
 		return
 	}

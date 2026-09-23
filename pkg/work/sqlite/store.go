@@ -22,6 +22,9 @@ import (
 
 type Store struct {
 	db *sql.DB
+	// now is the clock LeaseJob and FailJob use to set and compare
+	// retry_not_before. time.Now outside tests.
+	now func() time.Time
 }
 
 func New(path string) (*Store, error) {
@@ -51,7 +54,7 @@ func New(path string) (*Store, error) {
 	// own connection queue the single serialization point instead.
 	db.SetMaxOpenConns(1)
 
-	store := &Store{db: db}
+	store := &Store{db: db, now: time.Now}
 	if err := store.initSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -137,6 +140,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   terminal_submitted INTEGER NOT NULL DEFAULT 0,
   execution_id TEXT NOT NULL DEFAULT '',
   execution_terminal INTEGER NOT NULL DEFAULT 0,
+  retry_not_before INTEGER,
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -163,6 +167,44 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 	}
 	if err := s.migrateExecutionIdentity(ctx); err != nil {
 		return fmt.Errorf("migrate execution_identity: %w", err)
+	}
+	if err := s.migrateRetryNotBefore(ctx); err != nil {
+		return fmt.Errorf("migrate retry_not_before: %w", err)
+	}
+	return nil
+}
+
+// migrateRetryNotBefore adds the retry_not_before column (see
+// work.Job.RetryNotBefore) to a jobs table created before retry pacing
+// existed, following the same one-transaction check-then-ALTER pattern as
+// migrateResultDelivery. The column holds UTC Unix nanoseconds so LeaseJob
+// compares due times numerically rather than as variable-precision text.
+// Pre-existing rows migrate to NULL, which LeaseJob treats as due: a job
+// requeued before this migration stays leasable, and pacing starts with its
+// next retryable failure.
+func (s *Store) migrateRetryNotBefore(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	has, hasErr := hasColumn(ctx, tx, "jobs", "retry_not_before")
+	if hasErr != nil {
+		return hasErr
+	}
+	if !has {
+		if _, execErr := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN retry_not_before INTEGER`); execErr != nil {
+			return fmt.Errorf("add retry_not_before column: %w", execErr)
+		}
+	}
+	const idx = `CREATE INDEX IF NOT EXISTS idx_jobs_status_retry_not_before ON jobs(status, retry_not_before)`
+	if _, execErr := tx.ExecContext(ctx, idx); execErr != nil {
+		return fmt.Errorf("create retry_not_before index: %w", execErr)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
 	}
 	return nil
 }
@@ -519,16 +561,22 @@ func (s *Store) LeaseJob(ctx context.Context, worker string, ttl time.Duration) 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	// A job past its lease deadline is reclaimable regardless of whether it's
 	// still 'leased' (never heartbeated) or has progressed to 'running'
 	// (heartbeated at least once). Without matching 'running' here, a worker
 	// that crashes after a job's first heartbeat strands that job forever -
 	// Heartbeat moves it out of 'leased' well before most jobs finish, so
 	// 'running' is the status a stale, worker-crashed job is actually in.
+	//
+	// A queued job is only eligible once its retry_not_before is due (NULL is
+	// always due). The due check is part of the WHERE clause, not applied
+	// after picking the oldest row, so a delayed old job never hides a newer
+	// job that is due. Expired-lease reclaim is not gated by it.
 	const selectSQL = `
 SELECT job_id FROM jobs
-WHERE status = ? OR (status IN (?, ?) AND (lease_until IS NULL OR lease_until < ?))
+WHERE (status = ? AND (retry_not_before IS NULL OR retry_not_before <= ?))
+   OR (status IN (?, ?) AND (lease_until IS NULL OR lease_until < ?))
 ORDER BY created_at ASC
 LIMIT 1
 `
@@ -537,6 +585,7 @@ LIMIT 1
 		ctx,
 		selectSQL,
 		work.StatusQueued,
+		now.UnixNano(),
 		work.StatusLeased,
 		work.StatusRunning,
 		now.Format(time.RFC3339Nano),
@@ -551,7 +600,7 @@ LIMIT 1
 	leaseUntil := now.Add(ttl).UTC()
 	const updateSQL = `
 UPDATE jobs
-SET status = ?, attempt = attempt + 1, lease_owner = ?, lease_until = ?, updated_at = ?
+SET status = ?, attempt = attempt + 1, lease_owner = ?, lease_until = ?, retry_not_before = NULL, updated_at = ?
 WHERE job_id = ?
 `
 	_, err = tx.ExecContext(
@@ -602,22 +651,33 @@ func (s *Store) CompleteJob(ctx context.Context, jobID, worker, resultSummary st
 	return s.finishJob(ctx, jobID, worker, work.StatusSucceeded, "", resultSummary)
 }
 
-func (s *Store) FailJob(ctx context.Context, jobID, worker, lastError string, retryable bool) error {
+// FailJob implements work.Store. The retryable path requeues the job and sets
+// its retry_not_before in one UPDATE, fenced on the caller still holding a
+// live lease, so a requeued job is never visible without its due time and a
+// duplicate or stale call changes nothing.
+func (s *Store) FailJob(ctx context.Context, jobID, worker, lastError string, retryable bool, retryDelay time.Duration) error {
 	if retryable {
-		now := time.Now().UTC()
+		now := s.now().UTC()
+		var retryNotBefore any // NULL: due immediately
+		if retryDelay > 0 {
+			retryNotBefore = now.Add(retryDelay).UnixNano()
+		}
 		const retrySQL = `
 UPDATE jobs
-SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ?
+SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, retry_not_before = ?, updated_at = ?
+WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 `
 		res, err := s.db.ExecContext(
 			ctx,
 			retrySQL,
 			work.StatusQueued,
 			lastError,
+			retryNotBefore,
 			now.Format(time.RFC3339Nano),
 			jobID,
 			worker,
+			work.StatusLeased,
+			work.StatusRunning,
 		)
 		if err != nil {
 			return fmt.Errorf("retryable fail: %w", err)
@@ -661,7 +721,7 @@ SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_n
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
        status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
        result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error,
-       next_attempt_at, terminal_submitted, execution_id, execution_terminal
+       next_attempt_at, terminal_submitted, execution_id, execution_terminal, retry_not_before
 FROM jobs`
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
@@ -1045,6 +1105,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		nextAttemptAt        sql.NullString
 		terminalSubmitted    int
 		executionTerminal    int
+		retryNotBefore       sql.NullInt64
 		job                  work.Job
 	)
 
@@ -1076,9 +1137,14 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&terminalSubmitted,
 		&job.ExecutionID,
 		&executionTerminal,
+		&retryNotBefore,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if retryNotBefore.Valid {
+		ts := time.Unix(0, retryNotBefore.Int64).UTC()
+		job.RetryNotBefore = &ts
 	}
 	job.ValidationRequestID = validationRequestID.String
 	job.ResultDeliveryStatus = work.DeliveryStatus(resultDeliveryStatus)

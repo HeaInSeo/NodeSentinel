@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
@@ -149,12 +151,21 @@ const unknownRetryLimitReason = "UNKNOWN_RETRY_LIMIT"
 const unknownRetryMarker = "[unknown-retry]"
 
 // RetryDecision is decideRetry's output: whether NodeSentinel's WorkStore
-// should requeue the job (Retry) and the LastError/FailureReason text to
-// persist either way.
+// should requeue the job (Retry), how long the requeued job must wait before
+// it may be leased again (Delay, set only when Retry), and the
+// LastError/FailureReason text to persist either way.
 type RetryDecision struct {
 	Class  FailureClass
 	Retry  bool
-	Reason string // persisted via FailJob's lastError and the CheckRecord's FailureReason
+	Reason string        // persisted via FailJob's lastError and the CheckRecord's FailureReason
+	Delay  time.Duration // passed to FailJob as its retryDelay; zero when !Retry
+}
+
+// retryDelayFor computes RetryDecision.Delay for a retry granted after the
+// given attempt failed (see work.RetryDelay). A package-level var so tests can
+// substitute the jitter source or the whole schedule.
+var retryDelayFor = func(attempt int) time.Duration {
+	return work.RetryDelay(attempt, rand.Int63n) //nolint:gosec // jitter timing, not security-sensitive
 }
 
 // decideRetry applies NodeSentinel's bounded retry policy for a job whose
@@ -184,12 +195,15 @@ func decideRetry(class FailureClass, job *work.Job, reason string) RetryDecision
 		if job.Attempt >= maxAttempts {
 			return RetryDecision{Class: class, Retry: false, Reason: retryExhaustedReason + ": " + reason}
 		}
-		return RetryDecision{Class: class, Retry: true, Reason: reason + " " + unknownRetryMarker}
+		return RetryDecision{
+			Class: class, Retry: true, Reason: reason + " " + unknownRetryMarker,
+			Delay: retryDelayFor(job.Attempt),
+		}
 
 	default: // FailureClassTransientInfra
 		if job.Attempt >= maxAttempts {
 			return RetryDecision{Class: class, Retry: false, Reason: retryExhaustedReason + ": " + reason}
 		}
-		return RetryDecision{Class: class, Retry: true, Reason: reason}
+		return RetryDecision{Class: class, Retry: true, Reason: reason, Delay: retryDelayFor(job.Attempt)}
 	}
 }
