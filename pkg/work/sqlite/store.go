@@ -2,12 +2,15 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -22,6 +25,9 @@ type Store struct {
 }
 
 func New(path string) (*Store, error) {
+	if err := checkDirWritable(path); err != nil {
+		return nil, err
+	}
 	// _txlock=immediate makes every transaction opened on this DB (via
 	// Begin/BeginTx) issue "BEGIN IMMEDIATE" instead of SQLite's default
 	// deferred BEGIN. Deferred transactions take no lock until their first
@@ -57,6 +63,56 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// checkDirWritable verifies that the directory holding the database file can
+// actually be written to, and turns a failure into a diagnostic that names
+// the cause.
+//
+// This is a deployment-shaped problem, not a theoretical one (issue #2). The
+// container runs with readOnlyRootFilesystem and a non-root uid, so the
+// mounted volume is its only writable path, and a freshly provisioned
+// PersistentVolume is owned by root:root. If the Pod's securityContext is
+// missing fsGroup, every write fails with EACCES — but SQLite surfaces that
+// as "unable to open database file", with no mention of the directory, its
+// ownership, or the setting that fixes it. That error has to be debugged
+// from the outside. Failing here instead reports the actual path and points
+// at fsGroup.
+//
+// The check is on the *directory*, not the database file: SQLite needs to
+// create its rollback journal as a sibling of the database, so a writable
+// database file inside a read-only directory is still fatal — and on first
+// boot the database file does not exist yet, so it is not the thing to test.
+func checkDirWritable(path string) error {
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf(
+			"workstore directory %q is not usable: %w (is the volume mounted at this path?)", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf(
+			"workstore path %q resolves to a non-directory parent %q; "+
+				"NODESENTINEL_DB_PATH must name a file inside a mounted directory, "+
+				"so SQLite can place its rollback journal beside the database", path, dir)
+	}
+
+	probe, err := os.CreateTemp(dir, ".writecheck-*")
+	if err != nil {
+		return fmt.Errorf(
+			"workstore directory %q is not writable: %w — "+
+				"if this is a PersistentVolume, the Pod securityContext is most likely missing "+
+				"fsGroup (a newly provisioned volume is owned by root, and this process does not "+
+				"run as root); see deploy/03-nodesentinel.yaml", dir, err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		return fmt.Errorf("close write probe in %q: %w", dir, err)
+	}
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("remove write probe %q: %w", name, err)
+	}
+	return nil
+}
+
 func (s *Store) initSchema(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
@@ -79,6 +135,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   next_attempt_at TEXT,
   result_delivery_claimed_until TEXT,
   terminal_submitted INTEGER NOT NULL DEFAULT 0,
+  execution_id TEXT NOT NULL DEFAULT '',
+  execution_terminal INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT NOT NULL DEFAULT '',
@@ -102,6 +160,52 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 	}
 	if err := s.migrateTerminalSubmitted(ctx); err != nil {
 		return fmt.Errorf("migrate terminal_submitted: %w", err)
+	}
+	if err := s.migrateExecutionIdentity(ctx); err != nil {
+		return fmt.Errorf("migrate execution_identity: %w", err)
+	}
+	return nil
+}
+
+// migrateExecutionIdentity adds the execution_id/execution_terminal columns
+// (see work.Job.ExecutionID / Store.EnsureExecution) to a jobs table created
+// before this migration existed, following the same one-transaction
+// check-then-ALTER pattern as migrateResultDelivery. See that doc comment for
+// why a plain autocommit ALTER would race across connections.
+// Pre-existing rows migrate to an empty execution_id with execution_terminal
+// unset, which EnsureExecution reads as "no execution has been minted yet"
+// (it keys off the ID being empty, not off the terminal flag). There is no ID
+// to adopt for such a row, but minting one is not safe on its own: a leased or
+// running row may still have a Job running under the old attempt-derived
+// name, which a freshly minted identity would run beside. The worker retires
+// those Jobs before its first EnsureExecution for the row (see
+// pkg/worker's retireLegacyExecutions), so the store does not need to.
+func (s *Store) migrateExecutionIdentity(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	cols := []struct{ name, ddl string }{
+		{"execution_id", `ALTER TABLE jobs ADD COLUMN execution_id TEXT NOT NULL DEFAULT ''`},
+		{"execution_terminal", `ALTER TABLE jobs ADD COLUMN execution_terminal INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, col := range cols {
+		has, hasErr := hasColumn(ctx, tx, "jobs", col.name)
+		if hasErr != nil {
+			return hasErr
+		}
+		if has {
+			continue
+		}
+		if _, execErr := tx.ExecContext(ctx, col.ddl); execErr != nil {
+			return fmt.Errorf("add %s column: %w", col.name, execErr)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
 	}
 	return nil
 }
@@ -557,7 +661,7 @@ SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_n
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
        status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
        result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error,
-       next_attempt_at, terminal_submitted
+       next_attempt_at, terminal_submitted, execution_id, execution_terminal
 FROM jobs`
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
@@ -782,6 +886,135 @@ WHERE job_id = ? AND terminal_submitted = 0
 	return false, nil
 }
 
+// EnsureExecution implements work.Store.EnsureExecution: it adopts jobID's
+// in-flight execution identity if one exists, and mints a new one otherwise.
+//
+// Both branches run inside one transaction. The store opens every
+// transaction as BEGIN IMMEDIATE (see New's _txlock=immediate note), so the
+// read-then-decide here cannot interleave with another caller's write the
+// way a deferred transaction's would — two workers racing to start the same
+// job can never each mint a separate execution identity for it.
+//
+// The minted ID embeds the attempt the mint happened on purely for operator
+// traceability. Its uniqueness comes from the random suffix, not from
+// attempt — deriving identity from attempt is precisely the bug this
+// replaces (see work.Store.EnsureExecution), so nothing may key off that
+// segment.
+// The worker name is accepted to match work.Store.EnsureExecution (callers
+// pass their own identity) but is deliberately not persisted: an execution
+// identity belongs to the job, not to whichever worker happened to mint it,
+// and the current lease holder is already recorded separately as lease_owner.
+func (s *Store) EnsureExecution(ctx context.Context, jobID, _ string) (string, bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return "", false, fmt.Errorf("begin execution tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	var (
+		executionID       string
+		executionTerminal int
+		attempt           int
+	)
+	const selectSQL = `SELECT execution_id, execution_terminal, attempt FROM jobs WHERE job_id = ?`
+	if scanErr := tx.QueryRowContext(ctx, selectSQL, jobID).Scan(&executionID, &executionTerminal, &attempt); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return "", false, work.ErrNotFound
+		}
+		return "", false, fmt.Errorf("select execution identity: %w", scanErr)
+	}
+
+	// An execution that exists and has not been observed terminal may still
+	// be physically running in the cluster — adopt it. This is the branch
+	// that makes a reclaimed lease observe the previous worker's Job instead
+	// of racing a second one alongside it.
+	if executionID != "" && executionTerminal == 0 {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return "", false, fmt.Errorf("commit execution tx: %w", commitErr)
+		}
+		return executionID, true, nil
+	}
+
+	newID, err := newExecutionID(attempt)
+	if err != nil {
+		return "", false, err
+	}
+	now := time.Now().UTC()
+	const updateSQL = `
+UPDATE jobs
+SET execution_id = ?, execution_terminal = 0, updated_at = ?
+WHERE job_id = ?
+`
+	if _, execErr := tx.ExecContext(ctx, updateSQL, newID, now.Format(time.RFC3339Nano), jobID); execErr != nil {
+		return "", false, fmt.Errorf("mint execution identity: %w", execErr)
+	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		return "", false, fmt.Errorf("commit execution tx: %w", commitErr)
+	}
+	return newID, false, nil
+}
+
+// newExecutionID mints a fresh execution identity. The random suffix is what
+// makes it unique; the attempt prefix is operator-facing traceability only
+// (see EnsureExecution). crypto/rand's failure is surfaced rather than
+// silently falling back to a time- or attempt-derived value, because a
+// colliding identity would reintroduce exactly the duplicate-execution
+// hazard this type exists to prevent.
+func newExecutionID(attempt int) (string, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("generate execution id: %w", err)
+	}
+	return fmt.Sprintf("a%d-%s", attempt, hex.EncodeToString(buf[:])), nil
+}
+
+// MarkExecutionTerminal implements work.Store.MarkExecutionTerminal.
+//
+// The UPDATE is deliberately unconditional on the current flag: marking an
+// already-terminal execution terminal again is a harmless no-op, and callers
+// legitimately reach it twice (for example a Failed condition observed on a
+// poll that also ends the run). It does require a non-empty execution_id —
+// there is nothing to mark terminal before one is minted, and matching such
+// a row would let a later EnsureExecution believe an execution had run.
+//
+// The WHERE clause also matches the caller's observed execution_id, so a
+// stale worker's report about a replaced execution cannot release the
+// replacement (see work.Store.MarkExecutionTerminal).
+func (s *Store) MarkExecutionTerminal(ctx context.Context, jobID, executionID string) error {
+	now := time.Now().UTC()
+	const q = `
+UPDATE jobs
+SET execution_terminal = 1, updated_at = ?
+WHERE job_id = ? AND execution_id = ? AND execution_id != ''
+`
+	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID, executionID)
+	if err != nil {
+		return fmt.Errorf("mark execution terminal: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 1 {
+		return nil
+	}
+
+	var current string
+	err = s.db.QueryRowContext(ctx, `SELECT execution_id FROM jobs WHERE job_id = ?`, jobID).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return work.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("select execution identity: %w", err)
+	}
+	if current == "" {
+		// The job has no execution identity yet — nothing to mark.
+		return nil
+	}
+	return fmt.Errorf("%w: job %s is on execution %q, not %q",
+		work.ErrExecutionSuperseded, jobID, current, executionID)
+}
+
 // jobExists reports whether jobID has a row in the jobs table.
 func (s *Store) jobExists(ctx context.Context, jobID string) (bool, error) {
 	var one int
@@ -811,6 +1044,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		resultDeliveryStatus string
 		nextAttemptAt        sql.NullString
 		terminalSubmitted    int
+		executionTerminal    int
 		job                  work.Job
 	)
 
@@ -840,6 +1074,8 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&job.ResultDeliveryLastError,
 		&nextAttemptAt,
 		&terminalSubmitted,
+		&job.ExecutionID,
+		&executionTerminal,
 	)
 	if err != nil {
 		return nil, err
@@ -847,6 +1083,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 	job.ValidationRequestID = validationRequestID.String
 	job.ResultDeliveryStatus = work.DeliveryStatus(resultDeliveryStatus)
 	job.TerminalSubmitted = terminalSubmitted != 0
+	job.ExecutionTerminal = executionTerminal != 0
 
 	var actions []work.Action
 	if unmarshalErr := json.Unmarshal([]byte(actionsJSON), &actions); unmarshalErr != nil {

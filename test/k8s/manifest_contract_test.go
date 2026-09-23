@@ -246,6 +246,112 @@ func TestNodeSentinelDeploymentContract(t *testing.T) {
 	}
 }
 
+// TestNodeSentinelDurabilityContract pins the manifest half of issue #2:
+// the SQLite WorkStore must survive Pod replacement, and must never be open
+// by two Pods at once. Each assertion below corresponds to a way the
+// original emptyDir manifest lost queued work or risked a second writer, so
+// a regression on any one of them silently reintroduces data loss that only
+// shows up in production.
+func TestNodeSentinelDurabilityContract(t *testing.T) {
+	objects := readManifestObjects(t, "../../deploy/03-nodesentinel.yaml")
+	deployment := findObject(t, objects, "Deployment", "nodesentinel")
+	claim := findObject(t, objects, "PersistentVolumeClaim", "nodesentinel-data")
+
+	// --- single-writer contract -------------------------------------------
+	if got := nestedInt64(t, deployment.Object, "spec", "replicas"); got != 1 {
+		t.Fatalf("replicas = %d, want 1 — the embedded SQLite WorkStore has exactly one writer", got)
+	}
+	if got := nestedString(t, deployment.Object, "spec", "strategy", "type"); got != "Recreate" {
+		t.Fatalf("strategy.type = %q, want Recreate — RollingUpdate starts the replacement Pod "+
+			"while the outgoing one still holds the RWO volume", got)
+	}
+
+	// --- the volume is actually durable ------------------------------------
+	volumes := nestedSlice(t, deployment.Object, "spec", "template", "spec", "volumes")
+	var dataVolume map[string]any
+	for _, raw := range volumes {
+		volume := objectMap(t, raw)
+		if nestedString(t, volume, "name") == "data" {
+			dataVolume = volume
+		}
+	}
+	if dataVolume == nil {
+		t.Fatal("deployment is missing the \"data\" volume")
+	}
+	if _, isEmptyDir := dataVolume["emptyDir"]; isEmptyDir {
+		t.Fatal("the \"data\" volume must not be an emptyDir: it is lost on Pod deletion, " +
+			"rescheduling, and node failure — that is issue #2")
+	}
+	if got := nestedString(t, dataVolume, "persistentVolumeClaim", "claimName"); got != "nodesentinel-data" {
+		t.Fatalf("data volume claimName = %q, want nodesentinel-data", got)
+	}
+
+	// --- the DB and its journal share one mounted directory ----------------
+	containers := nestedSlice(t, deployment.Object, "spec", "template", "spec", "containers")
+	container := objectMap(t, containers[0])
+
+	var mountPath string
+	for _, raw := range nestedSlice(t, container, "volumeMounts") {
+		mount := objectMap(t, raw)
+		if nestedString(t, mount, "name") == "data" {
+			mountPath = nestedString(t, mount, "mountPath")
+			if subPath, ok := mount["subPath"]; ok {
+				t.Fatalf("data volumeMount must not use subPath (%v): mounting the database file "+
+					"alone leaves SQLite's rollback journal on the container filesystem, so the "+
+					"pair goes inconsistent across a Pod replacement", subPath)
+			}
+		}
+	}
+	if mountPath == "" {
+		t.Fatal("container does not mount the \"data\" volume")
+	}
+
+	var dbPath string
+	for _, raw := range nestedSlice(t, container, "env") {
+		envVar := objectMap(t, raw)
+		if nestedString(t, envVar, "name") == "NODESENTINEL_DB_PATH" {
+			dbPath = nestedString(t, envVar, "value")
+		}
+	}
+	if dbPath == "" {
+		t.Fatal("NODESENTINEL_DB_PATH is not set")
+	}
+	if !strings.HasPrefix(dbPath, mountPath+"/") {
+		t.Fatalf("NODESENTINEL_DB_PATH = %q is not inside the persistent mount %q — "+
+			"the database would be written to the container filesystem and lost on replacement",
+			dbPath, mountPath)
+	}
+
+	// --- the volume is writable by a non-root container ---------------------
+	// Without fsGroup the container starts and then fails at its first write:
+	// a freshly provisioned PV is owned by root and readOnlyRootFilesystem
+	// leaves this volume as the only writable path.
+	if got := nestedInt64(t, deployment.Object, "spec", "template", "spec", "securityContext", "fsGroup"); got == 0 {
+		t.Fatal("pod securityContext.fsGroup must be a non-root GID so the mounted volume is writable")
+	}
+
+	// --- the claim itself ---------------------------------------------------
+	accessModes := stringSlice(t, nestedSlice(t, claim.Object, "spec", "accessModes"))
+	if len(accessModes) != 1 || accessModes[0] != "ReadWriteOnce" {
+		t.Fatalf("claim accessModes = %v, want exactly [ReadWriteOnce] — a many-writer mode would "+
+			"let a second Pod open the same SQLite database", accessModes)
+	}
+	if got := nestedString(t, claim.Object, "spec", "resources", "requests", "storage"); got == "" {
+		t.Fatal("claim must request an explicit storage size")
+	}
+	// An empty storageClassName is not "unset" to Kubernetes — it disables
+	// dynamic provisioning and leaves the claim Pending forever. Omitting the
+	// field is how you ask for the cluster default; this guards the
+	// difference, which is easy to get wrong when templating per environment.
+	if raw, ok := claim.Object["spec"].(map[string]any)["storageClassName"]; ok {
+		className, isString := raw.(string)
+		if !isString || className == "" {
+			t.Fatalf("storageClassName is present but empty (%#v): omit the field to use the "+
+				"cluster default, or name a real class — an empty string disables provisioning", raw)
+		}
+	}
+}
+
 func TestNodeSentinelRBACContract(t *testing.T) {
 	objects := readManifestObjects(t, "../../deploy/02-rbac.yaml")
 	serviceAccount := findObject(t, objects, "ServiceAccount", "nodesentinel")

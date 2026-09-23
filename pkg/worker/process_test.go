@@ -30,13 +30,16 @@ func useFastWorkerTicks(t *testing.T) {
 	originalPoll := pollFrequency
 	originalHeartbeat := heartbeatFrequency
 	originalSmokeRun := smokeRunDuration
+	originalDeletionConfirm := deletionConfirmWait
 	pollFrequency = time.Millisecond
 	heartbeatFrequency = time.Millisecond
 	smokeRunDuration = 100 * time.Millisecond
+	deletionConfirmWait = 50 * time.Millisecond
 	t.Cleanup(func() {
 		pollFrequency = originalPoll
 		heartbeatFrequency = originalHeartbeat
 		smokeRunDuration = originalSmokeRun
+		deletionConfirmWait = originalDeletionConfirm
 	})
 }
 
@@ -411,6 +414,13 @@ func TestProcess_ProfileOnlyRequested_L5aFails_TerminalFailedRecord(t *testing.T
 	// (and assert) a genuine application-level L5-a failure — matching
 	// TestClassifySmokeRun_ApplicationFailure/TestProcess_L4NonRetryableFailure_SubmitsTerminalTrueAndClaimsSlot's
 	// fixture shape for L4's equivalent case.
+	// The L5-a Job name embeds the job's durable execution identity, so that
+	// identity has to exist before the "job-name" label is computed —
+	// otherwise process() mints one itself and the Job it actually creates
+	// carries a different name than the pod seeded here, leaving the
+	// classifier with no pod to inspect.
+	mintExecution(t, store, job)
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "l5a-pod",
@@ -627,7 +637,8 @@ func TestRunSmokeRun_Complete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec)
+	// adopted=false: this test drives the create path.
+	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false, true)
 	if !result.success {
 		t.Errorf("expected success, got failure: %s", result.reason)
 	}
@@ -650,7 +661,9 @@ func TestRunSmokeRun_CreateFails(t *testing.T) {
 	}
 
 	spec := buildSmokeJobSpec(job)
-	result := w.runSmokeRun(context.Background(), nil, smokeNamespace, job, spec)
+	// adopted=false is required here: an adopted run skips Create entirely,
+	// so the creation failure this test asserts on would never happen.
+	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, false, true)
 	if result.success {
 		t.Fatal("expected failure when job creation fails")
 	}
@@ -682,7 +695,8 @@ func TestRunSmokeRun_GetFails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec)
+	// adopted=false: the Job is created here, then polling fails.
+	result := w.runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, false, true)
 	if result.success {
 		t.Fatal("expected failure when Get fails")
 	}
@@ -860,6 +874,12 @@ func TestProcess_L4NonRetryableFailure_SubmitsTerminalTrueAndClaimsSlot(t *testi
 	// classifyFromPods returns retryable=false (application-level failure)
 	// — see TestClassifySmokeRun_ApplicationFailure for the same fixture
 	// shape at the classifier unit level.
+	//
+	// The Job name embeds the job's durable execution identity, so that
+	// identity must exist before the "job-name" label is computed — see
+	// mintExecution.
+	mintExecution(t, store, job)
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "smoke-pod",

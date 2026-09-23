@@ -41,7 +41,7 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		return w.submitNotAvailableScanRecord(ctx, logger, job)
 	}
 
-	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
+	scanID := fmt.Sprintf("l5b-%s", recordIDLabel(job.JobID))
 
 	reports, err := w.dynamicKube.Resource(trivyVulnReportGVR).Namespace(smokeNamespace).List(
 		ctx, metav1.ListOptions{},
@@ -119,7 +119,7 @@ func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.
 	if !w.claimTerminal(ctx, logger, job.JobID) {
 		return nil
 	}
-	scanID := fmt.Sprintf("l5b-%s", sanitizeDNSLabel(job.JobID))
+	scanID := fmt.Sprintf("l5b-%s", recordIDLabel(job.JobID))
 	req := vaultclient.SubmitScanRecordRequest{
 		ScanID:              scanID,
 		ImageDigest:         job.ImageDigest,

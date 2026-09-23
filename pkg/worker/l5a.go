@@ -10,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/vaultclient"
@@ -21,11 +22,15 @@ const (
 	l5aCommand    = "/bin/sh -c true" // minimal: image must start and exit 0
 )
 
-// l5aJobName returns a DNS-safe Job name for the L5-a validation run,
-// suffixed with job.Attempt for the same reason smokeJobName is — see its
-// doc comment for the collision this avoids.
+// l5aJobName returns a DNS-safe Job name for the L5-a validation run, keyed
+// on the job's durable execution identity for the same reason smokeJobName
+// is — see its doc comment for both the AlreadyExists collision and the
+// concurrent-duplicate-execution hole this naming avoids. L5-a runs inside
+// the same leased execution as the L4 smoke-run it follows, so it shares
+// that execution's identity; the distinct "l5a-" prefix keeps the two Job
+// objects from colliding with each other.
 func l5aJobName(job *work.Job) string {
-	return fmt.Sprintf("l5a-%s-%d", sanitizeDNSLabel(job.JobID), job.Attempt)
+	return fmt.Sprintf("l5a-%s-%s", sanitizeDNSLabel(job.JobID), job.ExecutionID)
 }
 
 // l5aCommandSlice returns the Command slice used in the K8s Job spec.
@@ -57,8 +62,8 @@ func buildL5aJobSpec(job *work.Job) *batchv1.Job {
 			Name:      l5aJobName(job),
 			Namespace: smokeNamespace,
 			Labels: map[string]string{
-				"app":                 "nodevault-l5a",
-				"nodesentinel.io/job": job.JobID,
+				"app":      "nodevault-l5a",
+				jobIDLabel: job.JobID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -101,7 +106,7 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		return nil
 	}
 
-	checkID := fmt.Sprintf("l5a-%s", sanitizeDNSLabel(job.JobID))
+	checkID := fmt.Sprintf("l5a-%s", recordIDLabel(job.JobID))
 	command := l5aCommand
 	startedAt := time.Now()
 
@@ -110,17 +115,53 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 	defer cancel()
 
 	created, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(l5aCtx, jobSpec, metav1.CreateOptions{})
-	if err != nil {
+	switch {
+	case apierrors.IsAlreadyExists(err):
+		// This execution's L5-a Job is already in the cluster — a previous
+		// worker created it and stopped heartbeating before deleting it, and
+		// this attempt adopted the same execution identity (see
+		// work.Store.EnsureExecution). Observe that Job rather than treating
+		// its existence as a creation failure; creating a second one is both
+		// impossible under this name and, as a differently-named Job, exactly
+		// the duplicate execution the identity scheme exists to prevent.
+		logger.Info("L5-a validation Job already exists — adopting", "k8s_job", jobSpec.Name)
+		created = jobSpec
+	case err != nil && createRejected(err):
+		// Nothing runs under this identity any more: L4 has finished and
+		// the L5-a Job was never created. process() left the identity open
+		// for L5-a (see l5aFollows), so release it here.
 		logger.Warn("L5-a job creation failed", "err", err)
+		w.markExecutionTerminal(ctx, logger, job)
 		w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, err.Error())
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
 			outcome{class: FailureClassTransientInfra, reason: "infra-level: job creation failed: " + err.Error()}))
+	case err != nil:
+		// The Create may have been persisted despite the error (see
+		// runSmokeRun). Unlike L4, nothing retries this stage: process()
+		// completes the job whatever runL5a returns, so an identity left
+		// adoptable here is never observed again. Settle the outcome now.
+		logger.Warn("L5-a job create outcome unknown — reconciling under the same name", "err", err)
+		if !w.reconcileL5aCreate(l5aCtx, logger, jobSpec) {
+			// Still unknown. The identity stays non-terminal because a Job
+			// may yet run under it, and the record says the outcome is
+			// unknown rather than that creation failed. If the Job does
+			// land, it runs unobserved; ActiveDeadlineSeconds bounds it and
+			// TTLSecondsAfterFinished reaps it.
+			reason := "infra-level: L5-a Job create outcome unknown; a late Job would run unobserved: " + err.Error()
+			logger.Warn("L5-a: validation Job create outcome still unknown — leaving execution non-terminal",
+				"k8s_job", jobSpec.Name)
+			w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, reason)
+			return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
+				outcome{class: FailureClassTransientInfra, reason: reason}))
+		}
+		created = jobSpec
+	default:
+		logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 	}
-	logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 
 	exitCode, result, runErr := w.waitL5aJob(l5aCtx, logger, job, created.Name)
 	durationSec := int64(time.Since(startedAt).Seconds())
-	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil {
+	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil && !apierrors.IsNotFound(delErr) {
 		logger.Warn("L5-a: failed to delete K8s Job — TTL will clean up",
 			"job", created.Name, "err", delErr)
 	}
@@ -145,6 +186,42 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
 		validationStatus: "succeeded",
 	})
+}
+
+// l5aCreateReconcileAttempts bounds how many times reconcileL5aCreate
+// re-issues an L5-a Create whose outcome is unknown. A var so tests can lower
+// it.
+var l5aCreateReconcileAttempts = 3
+
+// reconcileL5aCreate settles an L5-a Create whose outcome is unknown by
+// re-issuing it under the same deterministic name, pollFrequency apart. It
+// reports true once a Job exists under that name: this call created it, or
+// AlreadyExists shows the original Create landed. The name is the
+// idempotency key, so at most one of the requests creates a Job. A rejected
+// re-create proves nothing about the original request, so it is retried like
+// any other error. Returns false when ctx ends or the attempts run out.
+func (w *Worker) reconcileL5aCreate(ctx context.Context, logger *slog.Logger, jobSpec *batchv1.Job) bool {
+	for i := 0; i < l5aCreateReconcileAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(pollFrequency):
+			}
+		}
+		_, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(ctx, jobSpec, metav1.CreateOptions{})
+		switch {
+		case err == nil:
+			logger.Info("L5-a validation Job created on reconcile", "k8s_job", jobSpec.Name)
+			return true
+		case apierrors.IsAlreadyExists(err):
+			logger.Info("L5-a validation Job exists despite create error — adopting", "k8s_job", jobSpec.Name)
+			return true
+		default:
+			logger.Warn("L5-a: reconcile create failed", "k8s_job", jobSpec.Name, "attempt", i+1, "err", err)
+		}
+	}
+	return false
 }
 
 // l5aFailureSubmission builds the checkRecordSubmission for an L5-a failure
@@ -197,6 +274,12 @@ func l5aFailureSubmission(checkID, command string, terminal bool, exitCode int, 
 // onto classifyFromPods both removes the duplication and fixes the bug (L5-a
 // now detects OOM specifically, routing it through
 // FailureClassResourceObservation instead of a blanket infra_failed).
+//
+// The L5-a Job is the last Kubernetes work under job's execution identity,
+// so this also releases that identity — with the same rule runSmokeRun
+// follows: only once the Job is known not to be running (a terminal
+// condition, or removal confirmed after a timeout). On a Get error the
+// identity is left adoptable.
 func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.Job, jobName string) (int, outcome, error) {
 	pollTick := time.NewTicker(pollFrequency)
 	heartbeatTick := time.NewTicker(heartbeatFrequency)
@@ -206,6 +289,12 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 	for {
 		select {
 		case <-ctx.Done():
+			if err := w.deleteAndConfirmGone(smokeNamespace, jobName); err == nil {
+				w.markExecutionTerminal(context.Background(), logger, job)
+			} else {
+				logger.Warn("L5-a: validation Job not confirmed gone after timeout — "+
+					"leaving execution adoptable rather than risking a duplicate", "k8s_job", jobName, "err", err)
+			}
 			result := outcome{class: FailureClassTransientInfra, reason: "L5-a timeout: job did not complete within allotted time"}
 			return 0, result, errors.New(result.reason)
 		case <-heartbeatTick.C:
@@ -221,10 +310,12 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 			for _, cond := range k8sJob.Status.Conditions {
 				switch {
 				case cond.Type == "Complete" && cond.Status == "True":
+					w.markExecutionTerminal(ctx, logger, job)
 					return 0, outcome{success: true}, nil
 				case cond.Type == "Failed" && cond.Status == "True":
 					result := classifyFromPods(ctx, w.kube, smokeNamespace, jobName, cond.Reason, cond.Message)
 					code := w.extractPodExitCode(ctx, jobName)
+					w.markExecutionTerminal(ctx, logger, job)
 					return code, result, fmt.Errorf("job failed: %s", cond.Message)
 				}
 			}

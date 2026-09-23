@@ -1,4 +1,39 @@
 ---
+# Durable storage for the SQLite WorkStore (issue #2).
+#
+# This claim holds the *directory* NODESENTINEL_DB_PATH lives in, not the
+# database file alone. SQLite writes its rollback journal as a sibling of the
+# database file, and a crash is only recoverable if the journal survives
+# alongside the database it belongs to — mounting the file on its own would
+# leave the journal on the container filesystem and make the pair
+# inconsistent across a Pod replacement.
+#
+# ── Per-environment inputs ────────────────────────────────────────────────
+# 1. storageClassName — deliberately omitted so the cluster's default
+#    StorageClass is used. Set it explicitly for environments that have no
+#    default, or that must pin a specific class. Do NOT set it to "" as a
+#    way of "leaving it blank": the empty string is meaningful to Kubernetes
+#    and disables dynamic provisioning entirely, leaving this claim Pending
+#    forever.
+# 2. resources.requests.storage — sized for a work queue of job rows, not
+#    for artifacts. Raise it for environments with long retention.
+# 3. accessModes — ReadWriteOnce. This is a correctness constraint, not a
+#    preference: see the single-writer note on the Deployment below.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nodesentinel-data
+  namespace: nodesentinel-system
+  labels:
+    app.kubernetes.io/name: nodesentinel
+    app.kubernetes.io/component: validation-agent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,7 +43,24 @@ metadata:
     app.kubernetes.io/name: nodesentinel
     app.kubernetes.io/component: validation-agent
 spec:
+  # replicas and strategy are a single-writer contract, not tuning knobs.
+  #
+  # The WorkStore is an embedded SQLite database on one ReadWriteOnce volume.
+  # Two Pods must never have it open at once, so:
+  #   - replicas stays 1, and
+  #   - strategy is Recreate, which tears the old Pod down *before* starting
+  #     the new one. The default RollingUpdate does the opposite — it starts
+  #     the replacement while the outgoing Pod still holds the volume — which
+  #     for a single RWO claim either wedges the rollout or, on a shared
+  #     filesystem, gives two processes the same database.
+  #
+  # Scope note (do not over-read this): serialized replacement is what
+  # protects a *graceful* rollout. It is not a fencing mechanism. A network
+  # partition or a force-detach can still strand a writer, and neither
+  # Recreate nor RWO prevents that — see docs/DEPLOYMENT.md.
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: nodesentinel
@@ -21,6 +73,24 @@ spec:
       serviceAccountName: nodesentinel
       securityContext:
         runAsNonRoot: true
+        # fsGroup is what actually makes the mounted volume writable.
+        # runAsNonRoot alone only asserts "not uid 0"; a freshly provisioned
+        # PV is owned by root, so without fsGroup the container starts fine
+        # and then fails at its first write with a bare EACCES —
+        # readOnlyRootFilesystem below means this volume is the container's
+        # only writable path, so that failure is fatal.
+        #
+        # fsGroup makes the kubelet chgrp the volume to this GID, mount it
+        # setgid, and add the GID to the container's supplementary groups.
+        # That grants write access through the *group*, so it holds whatever
+        # uid the image runs as — deliberately not paired with a runAsUser
+        # pin here, since this repo does not build the image and cannot
+        # assert which uid it uses.
+        fsGroup: 65532
+        # OnRootMismatch skips the recursive chown when the top-level
+        # directory already has the right ownership, so restarts stay fast as
+        # the queue grows instead of re-walking every file each time.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -71,7 +141,8 @@ spec:
                 - ALL
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nodesentinel-data
 ---
 apiVersion: v1
 kind: Service

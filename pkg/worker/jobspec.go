@@ -21,6 +21,11 @@ const (
 	leaseTTL          = 2 * 60 // seconds; worker lease duration
 	heartbeatInterval = 30     // seconds; how often Heartbeat is called during L4
 	pollInterval      = 5      // seconds; LeaseJob polling interval
+
+	// jobIDLabel carries the WorkStore job ID on every Job this worker
+	// creates, under every naming scheme it has ever used — see
+	// retireLegacyExecutions, which relies on that.
+	jobIDLabel = "nodesentinel.io/job"
 )
 
 // buildSmokeJobSpec constructs the K8s Job object used for both the L3
@@ -39,8 +44,8 @@ func buildSmokeJobSpec(job *work.Job) *batchv1.Job {
 			Name:      smokeJobName(job),
 			Namespace: smokeNamespace,
 			Labels: map[string]string{
-				"app":                 "nodevault-smoke",
-				"nodesentinel.io/job": job.JobID,
+				"app":      "nodevault-smoke",
+				jobIDLabel: job.JobID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -62,34 +67,73 @@ func buildSmokeJobSpec(job *work.Job) *batchv1.Job {
 	}
 }
 
-// smokeJobName derives a DNS-1123-safe Job name from the work.Job's ID *and*
-// its current attempt number (work.Job.Attempt, incremented on every
-// LeaseJob call — see pkg/work/sqlite/store.go), so it stays traceable back
-// to the WorkStore job while also being unique per attempt.
+// smokeJobName derives a DNS-1123-safe Job name from the work.Job's ID and
+// its durable *execution identity* (work.Job.ExecutionID, minted/adopted by
+// work.Store.EnsureExecution), so it stays traceable back to the WorkStore
+// job while naming exactly one physical execution.
 //
-// Before the attempt suffix was added, a retried job reused the exact same
-// K8s Job name across attempts. That collided in a reachable, non-crash
-// scenario: runSmokeRun's poll loop's Get error path (transient K8s API
-// failure) returns a retryable outcome without deleting the in-flight K8s
-// Job object first (unlike the Complete/Failed/ctx.Done() paths, which all
-// clean up before returning) — see runSmokeRun. The job then gets requeued
-// (FailJob(..., retryable=true)) and re-leased while its previous attempt's
-// K8s Job object is often still present (its own TTLSecondsAfterFinished
-// only starts counting once *it* finishes, and this one never did), so the
-// next attempt's Create call at the top of runSmokeRun fails with
-// AlreadyExists — immediately, deterministically, every time this exact
-// sequence recurs, not just on worker-crash/lease-expiry reclaim. The
-// attempt suffix removes the collision at its root: every attempt gets its
-// own K8s Job name regardless of whether the previous attempt's object was
-// ever cleaned up.
+// History — why this is keyed on ExecutionID and not on Attempt:
+//
+// Originally the name was job-ID-only, so a retried job reused the exact
+// same K8s Job name across attempts. That collided in a reachable,
+// non-crash scenario: runSmokeRun's poll loop's Get error path (transient
+// K8s API failure) returns a retryable outcome without deleting the
+// in-flight K8s Job object first, the job gets requeued and re-leased while
+// the previous attempt's object is still present, and the next Create fails
+// with AlreadyExists.
+//
+// The first fix appended job.Attempt. That removed the collision but opened
+// a strictly worse hole: work.Store.LeaseJob increments attempt on *every*
+// lease, including when it reclaims a merely-expired lease whose worker
+// died without its K8s Job dying. The reclaiming attempt then computed a
+// *different* name and created a second Job while the first was still
+// running — two concurrent physical executions of one logical validation,
+// which NodeSentinel #2's acceptance explicitly forbids. Uniqueness per
+// attempt and at-most-one-execution are different properties, and attempt
+// only ever provided the first.
+//
+// ExecutionID provides both: it is stable across the attempts that adopt an
+// in-flight execution (so no duplicate is ever created), and it changes once
+// the previous execution is terminal and the retry policy permits a new one
+// (so no AlreadyExists collision either). Nothing here may go back to
+// deriving the name from job.Attempt.
 func smokeJobName(job *work.Job) string {
-	return fmt.Sprintf("smoke-%s-%d", sanitizeDNSLabel(job.JobID), job.Attempt)
+	return fmt.Sprintf("smoke-%s-%s", sanitizeDNSLabel(job.JobID), job.ExecutionID)
 }
 
 // sanitizeDNSLabel lowercases and strips characters that are not valid in a
 // K8s object name, truncating to fit the 63-character DNS label limit.
 func sanitizeDNSLabel(s string) string {
-	const maxLen = 50 // leave room for the "smoke-" prefix
+	// Budget against the 63-char limit for the longest name built from this:
+	// "smoke-" (6) + this label + "-" (1) + an execution ID (see
+	// sqlite.newExecutionID: "a" + attempt digits + "-" + 16 hex chars, so
+	// 22 even allowing a 4-digit attempt) = 29 chars of overhead. 63-29=34,
+	// so 30 leaves headroom. This was 50 back when the suffix was a bare
+	// attempt number; keeping 50 would now overflow the limit and make the
+	// API server reject every Job for a long job ID. Only Job names carry
+	// this budget; NodeVault record IDs use recordIDLabel.
+	return sanitizeDNSLabelMax(s, 30)
+}
+
+// legacySanitizedIDMaxLen is the historical job-ID truncation: workers
+// without execution identities applied it in their attempt-derived Job names,
+// and every NodeVault record ID (CheckID, ScanID) has always used it. Job
+// names must not use it (see sanitizeDNSLabel); isLegacyJobName and
+// recordIDLabel must, because a normal ingress ID ("job-" + 32 hex) is longer
+// than 30.
+const legacySanitizedIDMaxLen = 50
+
+// recordIDLabel returns the job-ID part of a NodeVault CheckID or ScanID. It
+// keeps the historical truncation rather than the Job-name one: record IDs
+// are not bound by the DNS label budget, and NodeVault matches a resubmitted
+// check by ID, so a record ID that changed across an upgrade would duplicate
+// an in-flight job's evidence instead of hitting its idempotency check.
+func recordIDLabel(jobID string) string {
+	return sanitizeDNSLabelMax(jobID, legacySanitizedIDMaxLen)
+}
+
+// sanitizeDNSLabelMax is sanitizeDNSLabel with an explicit truncation length.
+func sanitizeDNSLabelMax(s string, maxLen int) string {
 	out := make([]byte, 0, len(s))
 	for _, c := range []byte(s) {
 		switch {
