@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -660,6 +661,13 @@ func (w *Worker) createSmokeJob(
 //
 // A job ID that is not a valid label value selects nothing. The API server
 // would have rejected a Job carrying it, so no legacy Job can exist.
+//
+// The caller's empty ExecutionID is a snapshot. If this worker's lease expired
+// and another worker has since minted an identity and created its Job, that
+// Job carries the same label. Two guards keep it alive: only Jobs whose name
+// has the legacy attempt-derived form are deleted (isLegacyJobName), and the
+// stored identity is re-read before each delete. If it is no longer empty,
+// retirement stops with an error and this attempt mints nothing.
 func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger, job *work.Job) error {
 	selector, selErr := labels.ValidatedSelectorFromSet(labels.Set{jobIDLabel: job.JobID})
 	if selErr != nil {
@@ -674,6 +682,17 @@ func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger
 	}
 	for i := range list.Items {
 		name := list.Items[i].Name
+		if !isLegacyJobName(name, job.JobID) {
+			logger.Info("not retiring Job: name is not attempt-derived", "k8s_job", name)
+			continue
+		}
+		stored, getErr := w.store.GetJob(ctx, job.JobID)
+		if getErr != nil {
+			return fmt.Errorf("re-read execution identity for %s: %w", job.JobID, getErr)
+		}
+		if stored.ExecutionID != "" {
+			return fmt.Errorf("%w: %s now has execution %s", errLegacyRetireSuperseded, job.JobID, stored.ExecutionID)
+		}
 		logger.Warn("retiring Job left by a worker without execution identities", "k8s_job", name)
 		if delErr := w.deleteAndConfirmGone(smokeNamespace, name); delErr != nil {
 			return delErr
@@ -685,6 +704,27 @@ func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger
 		}
 	}
 	return nil
+}
+
+// errLegacyRetireSuperseded is returned by retireLegacyExecutions when
+// another worker minted an execution identity for the row while this one was
+// retiring legacy Jobs.
+var errLegacyRetireSuperseded = errors.New("execution identity minted by another worker")
+
+// isLegacyJobName reports whether name has the attempt-derived form used by
+// workers without execution identities: "smoke-<id>-<attempt>" or
+// "l5a-<id>-<attempt>", where <attempt> is a decimal integer. Current names
+// end in an execution ID, which starts with "a" (see sqlite.newExecutionID),
+// so they never match.
+func isLegacyJobName(name, jobID string) bool {
+	id := sanitizeDNSLabel(jobID)
+	for _, prefix := range []string{"smoke-", "l5a-"} {
+		attempt, ok := strings.CutPrefix(name, prefix+id+"-")
+		if ok && attempt != "" && strings.Trim(attempt, "0123456789") == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // markExecutionTerminal releases job's execution identity — the one this

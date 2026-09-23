@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -438,6 +439,131 @@ func TestProcess_LegacyJobNotConfirmedGone_MintsNothing(t *testing.T) {
 	}
 	if stored.Status != work.StatusQueued {
 		t.Fatalf("Status = %q, want queued for a retry", stored.Status)
+	}
+}
+
+// staleSnapshotAfterReplacement reproduces a stale retirement. A worker
+// leased a legacy row (ExecutionID still empty) and lost its lease. A
+// replacement worker reclaimed the row, minted an identity and created its Job
+// under the new-scheme name. It returns the stale worker's snapshot and the
+// replacement Job's name.
+func staleSnapshotAfterReplacement(t *testing.T, store work.Store, kube *fake.Clientset, jobID string) (*work.Job, string) {
+	t.Helper()
+	ctx := context.Background()
+	stale, err := store.LeaseJob(ctx, "stale-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (stale): %v", err)
+	}
+	if stale.ExecutionID != "" {
+		t.Fatalf("setup: stale ExecutionID = %q, want empty", stale.ExecutionID)
+	}
+	// Stands in for lease expiry: the row becomes leasable by another worker.
+	if err := store.FailJob(ctx, jobID, "stale-worker", "lease expired", true); err != nil {
+		t.Fatalf("FailJob (requeue): %v", err)
+	}
+	replacement, err := store.LeaseJob(ctx, "replacement-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (replacement): %v", err)
+	}
+	executionID, _, err := store.EnsureExecution(ctx, jobID, "replacement-worker")
+	if err != nil {
+		t.Fatalf("EnsureExecution (replacement): %v", err)
+	}
+	replacement.ExecutionID = executionID
+	spec := buildSmokeJobSpec(replacement)
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Create(ctx, spec, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create replacement Job: %v", err)
+	}
+	kube.ClearActions()
+	return stale, spec.Name
+}
+
+// deletedJobs returns the names of the Jobs kube saw deleted.
+func deletedJobs(kube *fake.Clientset) []string {
+	var names []string
+	for _, a := range kube.Actions() {
+		if da, ok := a.(k8stesting.DeleteActionImpl); ok {
+			names = append(names, da.GetName())
+		}
+	}
+	return names
+}
+
+// TestRetireLegacyExecutions_StaleWorkerKeepsReplacementJob: the replacement
+// Job carries the same job label as legacy Jobs, but its name is not
+// attempt-derived. A stale worker's retirement must leave it running.
+func TestRetireLegacyExecutions_StaleWorkerKeepsReplacementJob(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	legacyName := seedLegacyInFlightJob(t, store, kube, "legacy-stale")
+	// The replacement worker already retired the legacy Job before minting.
+	if err := kube.Tracker().Delete(jobsGVR, smokeNamespace, legacyName); err != nil {
+		t.Fatalf("remove legacy Job: %v", err)
+	}
+	stale, replacementName := staleSnapshotAfterReplacement(t, store, kube, "legacy-stale")
+
+	err := New(store, kube, "stale-worker").retireLegacyExecutions(context.Background(), slog.Default(), stale)
+	if err != nil {
+		t.Fatalf("retireLegacyExecutions: %v", err)
+	}
+	if got := deletedJobs(kube); len(got) != 0 {
+		t.Fatalf("deleted Jobs = %v, want none — the replacement's live execution was removed", got)
+	}
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(
+		context.Background(), replacementName, metav1.GetOptions{},
+	); err != nil {
+		t.Fatalf("replacement Job %q gone after stale retirement: %v", replacementName, err)
+	}
+}
+
+// TestRetireLegacyExecutions_IdentityMintedMeanwhile_DeletesNothing: if the
+// stored identity is no longer empty, the stale worker's snapshot is out of
+// date and it must stop without deleting even an attempt-named Job.
+func TestRetireLegacyExecutions_IdentityMintedMeanwhile_DeletesNothing(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	legacyName := seedLegacyInFlightJob(t, store, kube, "legacy-minted")
+	stale, replacementName := staleSnapshotAfterReplacement(t, store, kube, "legacy-minted")
+
+	err := New(store, kube, "stale-worker").retireLegacyExecutions(context.Background(), slog.Default(), stale)
+	if !errors.Is(err, errLegacyRetireSuperseded) {
+		t.Fatalf("retireLegacyExecutions err = %v, want errLegacyRetireSuperseded", err)
+	}
+	if got := deletedJobs(kube); len(got) != 0 {
+		t.Fatalf("deleted Jobs = %v, want none once another worker owns the identity", got)
+	}
+	for _, name := range []string{legacyName, replacementName} {
+		if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(
+			context.Background(), name, metav1.GetOptions{},
+		); err != nil {
+			t.Fatalf("Job %q gone after superseded retirement: %v", name, err)
+		}
+	}
+}
+
+func TestIsLegacyJobName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"smoke-job-1-3", true},
+		{"l5a-job-1-12", true},
+		// Execution-identity names.
+		{"smoke-job-1-a3-0123abcd", false},
+		{"l5a-job-1-a1-ffff", false},
+		{"smoke-job-1-", false},
+		// Another job ID that shares the prefix.
+		{"smoke-job-12-3", false},
+		{"trivy-job-1-3", false},
+	}
+	for _, tc := range cases {
+		if got := isLegacyJobName(tc.name, "job-1"); got != tc.want {
+			t.Errorf("isLegacyJobName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
