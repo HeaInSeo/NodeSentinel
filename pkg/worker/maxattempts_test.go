@@ -664,10 +664,20 @@ func TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating(t *testing.
 // the worker) is definitively not running, so its identity must be released
 // rather than left adoptable. Leaving it adoptable would strand the job —
 // every later attempt would try to observe a Job that no longer exists.
+//
+// This only holds once the Job is known to have been persisted, as it is here
+// by this call's own successful Create. An adopted identity whose Job was
+// never seen is re-created under the same name instead (see
+// TestRunSmokeRun_AdoptedNotFound_RecreatesUnderSameName).
 func TestRunSmokeRun_NotFoundDuringPoll_ReleasesExecution(t *testing.T) {
 	useFastWorkerTicks(t)
 
 	kube := fake.NewClientset()
+	// The Create succeeds, then the Job is gone by the first poll.
+	kube.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ga := action.(k8stesting.GetActionImpl)
+		return true, nil, k8serrors.NewNotFound(batchv1.Resource("jobs"), ga.GetName())
+	})
 	store := newTestStore(t)
 	w := New(store, kube, "test-worker")
 
@@ -682,10 +692,8 @@ func TestRunSmokeRun_NotFoundDuringPoll_ReleasesExecution(t *testing.T) {
 	}
 	mintExecution(t, store, job)
 
-	// Adopt a Job that is not in the cluster at all, so the first poll Get
-	// returns NotFound.
 	spec := buildSmokeJobSpec(job)
-	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, true, true)
+	result := w.runSmokeRun(context.Background(), slog.Default(), smokeNamespace, job, spec, false, true)
 	if result.success || !result.retryable {
 		t.Fatalf("a vanished Job should be a retryable failure, got %+v", result)
 	}

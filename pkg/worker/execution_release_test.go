@@ -641,6 +641,198 @@ func TestRunL5a_AmbiguousCreate_NotFound_StaysAdoptable(t *testing.T) {
 	}
 }
 
+// TestProcess_AmbiguousL4Create_RetryRecreatesSameName is the full sequence:
+// attempt 1's Create times out and the Job is not found, so the identity
+// stays adoptable. Attempt 2 adopts it, still finds no Job, and must create
+// under the same name rather than release the identity. A released identity
+// would let attempt 3 mint a new name while attempt 1's Create could still
+// land.
+func TestProcess_AmbiguousL4Create_RetryRecreatesSameName(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	var failedOnce atomic.Bool
+	failFirst := failRealCreate(kube, "smoke-", false, errCreateTimedOut())
+	kube.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if failedOnce.Load() {
+			return false, nil, nil
+		}
+		handled, obj, err := failFirst(action)
+		if handled {
+			failedOnce.Store(true)
+		}
+		return handled, obj, err
+	})
+	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+	w := New(store, kube, "test-worker")
+
+	job1 := leaseFresh(t, store, "ambiguous-then-adopted")
+	w.process(context.Background(), job1)
+	if job1.ExecutionID == "" {
+		t.Fatal("attempt 1 did not establish an execution identity")
+	}
+
+	job2, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob (attempt 2): %v", err)
+	}
+	w.process(context.Background(), job2)
+
+	if job2.ExecutionID != job1.ExecutionID {
+		t.Fatalf("attempt 2 ran under %q, want adopted %q", job2.ExecutionID, job1.ExecutionID)
+	}
+	want := smokeJobName(job1)
+	got := realJobCreates(kube)
+	if len(got) != 2 || got[0] != want || got[1] != want {
+		t.Fatalf("real Job creates = %v, want two creates of %q — a different name could run beside a late "+
+			"attempt-1 Job", got, want)
+	}
+	final, err := store.GetJob(context.Background(), job1.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if final.Status != work.StatusSucceeded {
+		t.Fatalf("final Status = %q (LastError %q), want succeeded", final.Status, final.LastError)
+	}
+	if !final.ExecutionTerminal {
+		t.Error("identity should be released once the re-created Job reached a terminal condition")
+	}
+}
+
+// TestRunSmokeRun_AdoptedNotFound_RecreatesUnderSameName: an adopted Job
+// that was never seen is created under the same name and observed. The
+// identity is not released on that first NotFound.
+func TestRunSmokeRun_AdoptedNotFound_RecreatesUnderSameName(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+	store := newTestStore(t)
+	job := leaseAndMint(t, store, "adopted-missing")
+	spec := buildSmokeJobSpec(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := New(store, kube, "test-worker").runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, true, true)
+	if !result.success {
+		t.Fatalf("want success from observing the re-created Job, got %+v", result)
+	}
+	if got := realJobCreates(kube); len(got) != 1 || got[0] != spec.Name {
+		t.Fatalf("real Job creates = %v, want exactly one create of %q", got, spec.Name)
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if !stored.ExecutionTerminal {
+		t.Error("identity should be released once the re-created Job completed")
+	}
+}
+
+// TestRunSmokeRun_AdoptedNotFound_OriginalCreateLandsFirst: the minting
+// attempt's delayed Create lands just before the re-create. The re-create
+// gets AlreadyExists and adopts that Job, so exactly one Job exists.
+func TestRunSmokeRun_AdoptedNotFound_OriginalCreateLandsFirst(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ca, ok := action.(k8stesting.CreateActionImpl)
+		if !ok || len(ca.GetCreateOptions().DryRun) > 0 {
+			return false, nil, nil
+		}
+		j, ok := ca.GetObject().(*batchv1.Job)
+		if !ok {
+			return false, nil, nil
+		}
+		if err := kube.Tracker().Create(jobsGVR, j.DeepCopy(), ca.GetNamespace()); err != nil {
+			t.Errorf("seed the late original Job: %v", err)
+		}
+		return false, nil, nil // the default reactor now answers AlreadyExists
+	})
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+	store := newTestStore(t)
+	job := leaseAndMint(t, store, "adopted-race")
+	spec := buildSmokeJobSpec(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := New(store, kube, "test-worker").runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, true, true)
+	if !result.success {
+		t.Fatalf("want success from adopting the original Job, got %+v", result)
+	}
+	list, err := kube.Tracker().List(jobsGVR, batchv1.SchemeGroupVersion.WithKind("Job"), smokeNamespace)
+	if err != nil {
+		t.Fatalf("list Jobs: %v", err)
+	}
+	if jobs := list.(*batchv1.JobList).Items; len(jobs) > 1 {
+		t.Fatalf("Jobs in cluster = %d, want at most one under %q", len(jobs), spec.Name)
+	}
+}
+
+// TestRunSmokeRun_AdoptedNotFound_AmbiguousRecreate_StaysAdoptable: the
+// re-create is itself ambiguous and the Job is still not found, so the
+// identity stays adoptable.
+func TestRunSmokeRun_AdoptedNotFound_AmbiguousRecreate_StaysAdoptable(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "smoke-", false, errCreateTimedOut()))
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+	store := newTestStore(t)
+	job := leaseAndMint(t, store, "adopted-ambiguous")
+	spec := buildSmokeJobSpec(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := New(store, kube, "test-worker").runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, true, true)
+	if result.success || !result.retryable {
+		t.Fatalf("want a retryable failure, got %+v", result)
+	}
+	if got := realJobCreates(kube); len(got) != 1 || got[0] != spec.Name {
+		t.Fatalf("real Job creates = %v, want exactly one create of %q", got, spec.Name)
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ExecutionTerminal {
+		t.Fatal("identity released after an ambiguous re-create — a late Job could run beside a fresh identity's Job")
+	}
+}
+
+// TestRunSmokeRun_AdoptedNotFound_RejectedRecreate_StaysAdoptable: a
+// rejection of the re-create says nothing about the minting attempt's own
+// Create, so unlike a first Create's rejection it does not release the
+// identity.
+func TestRunSmokeRun_AdoptedNotFound_RejectedRecreate_StaysAdoptable(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	kube := fake.NewClientset()
+	kube.PrependReactor("create", "jobs", failRealCreate(kube, "smoke-", false,
+		k8serrors.NewTooManyRequests("slow down", 1)))
+	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
+	store := newTestStore(t)
+	job := leaseAndMint(t, store, "adopted-rejected")
+	spec := buildSmokeJobSpec(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := New(store, kube, "test-worker").runSmokeRun(ctx, slog.Default(), smokeNamespace, job, spec, true, true)
+	if result.success || !result.retryable {
+		t.Fatalf("want a retryable failure, got %+v", result)
+	}
+	stored, err := store.GetJob(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ExecutionTerminal {
+		t.Fatal("identity released after a rejected re-create — the original Create may still land")
+	}
+}
+
 func leaseAndMint(t *testing.T, store work.Store, jobID string) *work.Job {
 	t.Helper()
 	job := leaseFresh(t, store, jobID)

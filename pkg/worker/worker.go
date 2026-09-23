@@ -477,8 +477,10 @@ func (w *Worker) runDryRun(ctx context.Context, ns string, jobSpec *batchv1.Job)
 // distinction is what keeps at most one execution alive per logical job:
 //
 //   - The execution is known not to be running (Complete, Failed, or the Job
-//     object is gone). markExecutionTerminal is called, releasing the
-//     identity so a later attempt may mint a fresh one.
+//     object is gone after it was known to exist). markExecutionTerminal is
+//     called, releasing the identity so a later attempt may mint a fresh one.
+//     An adopted Job that was never seen is not "gone": it is created under
+//     the same name instead.
 //   - The execution's state is unknown (a K8s API error, or ctx expiring
 //     mid-run without the Job's removal being confirmed). The identity is
 //     deliberately left non-terminal, so the next attempt adopts and
@@ -493,43 +495,15 @@ func (w *Worker) runSmokeRun(
 	name := jobSpec.Name
 	if adopted {
 		logger.Info("L4 observing adopted smoke-run Job", "k8s_job", name)
-	} else {
-		created, err := w.kube.BatchV1().Jobs(ns).Create(ctx, jobSpec, metav1.CreateOptions{})
-		switch {
-		case apierrors.IsAlreadyExists(err):
-			// The object exists under this execution's own name — this worker
-			// minted the identity and then died between the mint and a
-			// successful Create record, or is retrying the Create itself.
-			// Either way the existing object *is* this execution, so observe
-			// it. Creating a differently-named Job here is what produced
-			// concurrent duplicates before.
-			logger.Info("L4 smoke-run Job already exists — adopting", "k8s_job", name)
-		case createRejected(err):
-			// The API server refused the object, so nothing is running under
-			// this identity. Release it rather than stranding the job: leaving
-			// it non-terminal would make every later attempt try to adopt a
-			// Job that was never created.
-			w.markExecutionTerminal(ctx, logger, job.JobID)
-			return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
-				reason: "failed to create smoke-run Job: " + err.Error()}
-		case err != nil:
-			// The Create may have been persisted even though this call failed
-			// (lost response, timeout, 5xx). Look the deterministic name up
-			// instead of releasing the identity: a fresh identity would put a
-			// second Job beside one that may be running.
-			found, getErr := w.jobExists(ctx, ns, name)
-			if getErr != nil || !found {
-				logger.Warn("L4: smoke-run Job create outcome unknown — leaving execution adoptable",
-					"k8s_job", name, "err", err, "get_err", getErr)
-				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
-					reason: "create smoke-run Job (outcome unknown): " + err.Error()}
-			}
-			logger.Info("L4 smoke-run Job exists despite create error — adopting", "k8s_job", name, "err", err)
-		default:
-			name = created.Name
-			logger.Info("L4 smoke-run Job created", "k8s_job", name)
-		}
+	} else if res := w.createSmokeJob(ctx, logger, ns, job, jobSpec, true); res != nil {
+		return *res
 	}
+	// confirmed is true once this call knows a Job has been persisted under
+	// name: its own Create succeeded or hit AlreadyExists, or a poll saw the
+	// Job. Until then, NotFound for an adopted identity proves nothing. The
+	// attempt that minted it may have had an ambiguous Create that is still
+	// executing server-side (see the poll loop).
+	confirmed := !adopted
 
 	// Poll until Job completes, context expires, or deadline exceeds.
 	pollTick := time.NewTicker(pollFrequency)
@@ -557,11 +531,28 @@ func (w *Worker) runSmokeRun(
 			}
 		case <-pollTick.C:
 			k8sJob, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) && !confirmed {
+				// An adopted identity whose Job was never seen. The minting
+				// attempt's Create may have been ambiguous and still be in
+				// flight, so this NotFound does not show that nothing will
+				// run. Releasing here would let the next attempt mint a new
+				// name while that Create can still land. Create under the
+				// same deterministic name instead: the name is the
+				// idempotency key, so one of the two requests wins and the
+				// other gets AlreadyExists.
+				logger.Info("L4 adopted smoke-run Job not found — creating it under the same identity", "k8s_job", name)
+				if res := w.createSmokeJob(ctx, logger, ns, job, jobSpec, false); res != nil {
+					return *res
+				}
+				confirmed = true
+				continue
+			}
 			if apierrors.IsNotFound(err) {
 				// The Job is definitively gone — TTL-reaped, or deleted out
-				// from under us. Nothing is running, so release the identity
-				// and let the next attempt mint a fresh one. Retryable
-				// because no outcome was ever observed for this execution.
+				// from under us after it was persisted. Nothing is running,
+				// so release the identity and let the next attempt mint a
+				// fresh one. Retryable because no outcome was ever observed
+				// for this execution.
 				w.markExecutionTerminal(ctx, logger, job.JobID)
 				return outcome{success: false, retryable: true, class: FailureClassUnknown,
 					reason: "smoke-run Job no longer exists; outcome was never observed"}
@@ -573,6 +564,7 @@ func (w *Worker) runSmokeRun(
 				return outcome{success: false, retryable: true, class: FailureClassTransientInfra,
 					reason: "get smoke-run Job: " + err.Error()}
 			}
+			confirmed = true
 			for _, cond := range k8sJob.Status.Conditions {
 				if cond.Type == "Complete" && cond.Status == "True" {
 					if releaseOnSuccess {
@@ -590,6 +582,62 @@ func (w *Worker) runSmokeRun(
 			}
 		}
 	}
+}
+
+// createSmokeJob creates jobSpec's smoke-run Job under its deterministic
+// name. It returns nil when a Job now exists under that name: this call
+// created it, or it already existed, or it exists despite an ambiguous
+// Create error. Otherwise it returns the outcome runSmokeRun should report.
+//
+// releaseOnReject is false when re-creating an adopted Job that was never
+// seen. A rejection of this call then proves nothing about the minting
+// attempt's own Create, which may still land, so the identity stays
+// adoptable. maxAttempts bounds the retries.
+func (w *Worker) createSmokeJob(
+	ctx context.Context, logger *slog.Logger, ns string, job *work.Job, jobSpec *batchv1.Job,
+	releaseOnReject bool,
+) *outcome {
+	name := jobSpec.Name
+	_, err := w.kube.BatchV1().Jobs(ns).Create(ctx, jobSpec, metav1.CreateOptions{})
+	switch {
+	case apierrors.IsAlreadyExists(err):
+		// The object exists under this execution's own name — this worker
+		// minted the identity and then died between the mint and a
+		// successful Create record, or is retrying the Create itself.
+		// Either way the existing object *is* this execution, so observe
+		// it. Creating a differently-named Job here is what produced
+		// concurrent duplicates before.
+		logger.Info("L4 smoke-run Job already exists — adopting", "k8s_job", name)
+	case createRejected(err) && !releaseOnReject:
+		logger.Warn("L4: re-create of adopted smoke-run Job rejected — leaving execution adoptable",
+			"k8s_job", name, "err", err)
+		return &outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+			reason: "re-create adopted smoke-run Job: " + err.Error()}
+	case createRejected(err):
+		// The API server refused the object, so nothing is running under
+		// this identity. Release it rather than stranding the job: leaving
+		// it non-terminal would make every later attempt try to adopt a
+		// Job that was never created.
+		w.markExecutionTerminal(ctx, logger, job.JobID)
+		return &outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+			reason: "failed to create smoke-run Job: " + err.Error()}
+	case err != nil:
+		// The Create may have been persisted even though this call failed
+		// (lost response, timeout, 5xx). Look the deterministic name up
+		// instead of releasing the identity: a fresh identity would put a
+		// second Job beside one that may be running.
+		found, getErr := w.jobExists(ctx, ns, name)
+		if getErr != nil || !found {
+			logger.Warn("L4: smoke-run Job create outcome unknown — leaving execution adoptable",
+				"k8s_job", name, "err", err, "get_err", getErr)
+			return &outcome{success: false, retryable: true, class: FailureClassTransientInfra,
+				reason: "create smoke-run Job (outcome unknown): " + err.Error()}
+		}
+		logger.Info("L4 smoke-run Job exists despite create error — adopting", "k8s_job", name, "err", err)
+	default:
+		logger.Info("L4 smoke-run Job created", "k8s_job", name)
+	}
+	return nil
 }
 
 // retireLegacyExecutions deletes, and confirms gone, every Job in

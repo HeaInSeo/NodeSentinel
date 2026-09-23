@@ -98,7 +98,9 @@ func fakeJobWithCondition(ns, name string, condType batchv1.JobConditionType, st
 //
 // Consequence worth knowing when reading these tests: an adopted execution
 // skips the L3 dry-run and the L4 Create (see process), since the attempt
-// that minted the identity already did both. Tests that pin L4/L5-a
+// that minted the identity already did both. The one exception is an adopted
+// Job that is not found: it is then created under the same name (see
+// runSmokeRun). Tests that pin L4/L5-a
 // *classification* are unaffected; a test that needs the create path must
 // let process() mint the identity instead of calling this.
 func mintExecution(t *testing.T, store work.Store, job *work.Job) {
