@@ -314,6 +314,15 @@ func TestRunSmokeRun_Timeout_JobConfirmedGone_Releases(t *testing.T) {
 // as the migration leaves it. It returns the legacy Job's name.
 func seedLegacyInFlightJob(t *testing.T, store work.Store, kube *fake.Clientset, jobID string) string {
 	t.Helper()
+	return seedLegacyInFlightJobWithPrefix(t, store, kube, jobID, "smoke-")
+}
+
+// seedLegacyInFlightJobWithPrefix is seedLegacyInFlightJob for the legacy
+// Job of the given check ("smoke-" or "l5a-"). The name is built exactly as
+// those workers built it: the job ID sanitized and truncated to 50 characters,
+// then the attempt number.
+func seedLegacyInFlightJobWithPrefix(t *testing.T, store work.Store, kube *fake.Clientset, jobID, prefix string) string {
+	t.Helper()
 	req := newSmokeRunOnlyJob()
 	req.JobID = jobID
 	if _, err := store.CreateJob(context.Background(), req); err != nil {
@@ -323,7 +332,7 @@ func seedLegacyInFlightJob(t *testing.T, store work.Store, kube *fake.Clientset,
 	if err != nil {
 		t.Fatalf("LeaseJob (legacy attempt): %v", err)
 	}
-	legacyName := fmt.Sprintf("smoke-%s-%d", jobID, legacy.Attempt)
+	legacyName := fmt.Sprintf("%s%s-%d", prefix, sanitizeDNSLabelMax(jobID, legacySanitizedIDMaxLen), legacy.Attempt)
 	legacyJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
 		Name:      legacyName,
 		Namespace: smokeNamespace,
@@ -346,11 +355,36 @@ func seedLegacyInFlightJob(t *testing.T, store work.Store, kube *fake.Clientset,
 // Job, and see it gone, before it creates a Job under a fresh identity.
 // Otherwise two executions of one validation run at once.
 func TestProcess_LegacyInFlightJob_RetiredBeforeNewExecution(t *testing.T) {
+	assertLegacyRetiredBeforeNewExecution(t, "legacy-inflight")
+}
+
+// longIngressJobID has the form of every ingress-generated job ID: "job-"
+// plus 32 hex characters, 36 in all. That is longer than the current
+// sanitizeDNSLabel truncation (30) but shorter than the legacy one (50), so
+// the legacy Job name carries the whole ID.
+const longIngressJobID = "job-0123456789abcdef0123456789abcdef"
+
+// TestProcess_LegacyInFlightJob_LongIngressID_RetiredBeforeNewExecution: the
+// retirement must recognize a legacy Job whose name used the historical
+// 50-character truncation. With the current 30-character form it would skip
+// the Job and start a second execution beside it.
+func TestProcess_LegacyInFlightJob_LongIngressID_RetiredBeforeNewExecution(t *testing.T) {
+	if len(longIngressJobID) != 36 {
+		t.Fatalf("setup: len(longIngressJobID) = %d, want 36", len(longIngressJobID))
+	}
+	assertLegacyRetiredBeforeNewExecution(t, longIngressJobID)
+}
+
+// assertLegacyRetiredBeforeNewExecution processes a row whose legacy smoke Job
+// is still running and checks that the Job is deleted, and seen gone, before
+// the first real create, with the run then succeeding.
+func assertLegacyRetiredBeforeNewExecution(t *testing.T, jobID string) {
+	t.Helper()
 	useFastWorkerTicks(t)
 
 	store := newTestStore(t)
 	kube := fake.NewClientset()
-	legacyName := seedLegacyInFlightJob(t, store, kube, "legacy-inflight")
+	legacyName := seedLegacyInFlightJob(t, store, kube, jobID)
 
 	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
 	// New-scheme Jobs complete at once. The legacy Job is left to the default
@@ -563,6 +597,80 @@ func TestIsLegacyJobName(t *testing.T) {
 	for _, tc := range cases {
 		if got := isLegacyJobName(tc.name, "job-1"); got != tc.want {
 			t.Errorf("isLegacyJobName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIsLegacyJobName_LongJobID covers job IDs longer than the current
+// 30-character truncation: a normal 36-character ingress ID, and one longer
+// than the legacy 50-character truncation.
+func TestIsLegacyJobName_LongJobID(t *testing.T) {
+	long := longIngressJobID
+	veryLong := "job-" + strings.Repeat("0123456789abcdef", 4) // 68 chars
+	current := func(id string) string { return sanitizeDNSLabel(id) }
+	legacy := func(id string) string { return sanitizeDNSLabelMax(id, legacySanitizedIDMaxLen) }
+	cases := []struct {
+		name, jobID string
+		want        bool
+	}{
+		// Legacy names, as those workers built them.
+		{"smoke-" + long + "-1", long, true},
+		{"l5a-" + long + "-2", long, true},
+		{"smoke-" + legacy(veryLong) + "-3", veryLong, true},
+		{"l5a-" + legacy(veryLong) + "-3", veryLong, true},
+		// The current truncation followed by a bare number is accepted too.
+		{"smoke-" + current(long) + "-1", long, true},
+		// Execution-identity names never match, in either truncation.
+		{"smoke-" + current(long) + "-a1-0123456789abcdef", long, false},
+		{"l5a-" + current(long) + "-a2-0123456789abcdef", long, false},
+		{"smoke-" + long + "-a1-0123456789abcdef", long, false},
+		// Another job ID sharing the 30-character prefix.
+		{"smoke-" + current(long) + "x-1", long, false},
+	}
+	for _, tc := range cases {
+		if got := isLegacyJobName(tc.name, tc.jobID); got != tc.want {
+			t.Errorf("isLegacyJobName(%q, %q) = %v, want %v", tc.name, tc.jobID, got, tc.want)
+		}
+	}
+}
+
+// TestRetireLegacyExecutions_LongIngressID_RetiresSmokeAndL5a: with a normal
+// 36-character ingress ID, retirement deletes both the legacy smoke Job and
+// the legacy L5-a Job, whose names use the historical 50-character truncation.
+func TestRetireLegacyExecutions_LongIngressID_RetiresSmokeAndL5a(t *testing.T) {
+	useFastWorkerTicks(t)
+
+	store := newTestStore(t)
+	kube := fake.NewClientset()
+	smokeName := seedLegacyInFlightJobWithPrefix(t, store, kube, longIngressJobID, "smoke-")
+	if !strings.HasPrefix(smokeName, "smoke-"+longIngressJobID+"-") {
+		t.Fatalf("setup: legacy name %q does not carry the whole 36-char ID", smokeName)
+	}
+	l5aName := "l5a-" + strings.TrimPrefix(smokeName, "smoke-")
+	l5aJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name:      l5aName,
+		Namespace: smokeNamespace,
+		Labels:    map[string]string{"app": "nodevault-l5a", jobIDLabel: longIngressJobID},
+	}}
+	if _, err := kube.BatchV1().Jobs(smokeNamespace).Create(
+		context.Background(), l5aJob, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("seed legacy L5-a Job: %v", err)
+	}
+	kube.ClearActions()
+
+	job, err := store.LeaseJob(context.Background(), "test-worker", 60*time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob: %v", err)
+	}
+	if err := New(store, kube, "test-worker").retireLegacyExecutions(context.Background(), slog.Default(), job); err != nil {
+		t.Fatalf("retireLegacyExecutions: %v", err)
+	}
+	for _, name := range []string{smokeName, l5aName} {
+		if _, err := kube.BatchV1().Jobs(smokeNamespace).Get(
+			context.Background(), name, metav1.GetOptions{},
+		); !k8serrors.IsNotFound(err) {
+			t.Fatalf("legacy Job %q still present after retirement (err=%v)", name, err)
 		}
 	}
 }

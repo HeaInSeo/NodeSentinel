@@ -111,7 +111,17 @@ func sanitizeDNSLabel(s string) string {
 	// so 30 leaves headroom. This was 50 back when the suffix was a bare
 	// attempt number; keeping 50 would now overflow the limit and make the
 	// API server reject every Job for a long job ID.
-	const maxLen = 30
+	return sanitizeDNSLabelMax(s, 30)
+}
+
+// legacySanitizedIDMaxLen is the truncation workers without execution
+// identities applied to the job ID in their attempt-derived Job names. Only
+// isLegacyJobName may use it: recognizing those names needs the historical
+// form, and a normal ingress ID ("job-" + 32 hex) is longer than 30.
+const legacySanitizedIDMaxLen = 50
+
+// sanitizeDNSLabelMax is sanitizeDNSLabel with an explicit truncation length.
+func sanitizeDNSLabelMax(s string, maxLen int) string {
 	out := make([]byte, 0, len(s))
 	for _, c := range []byte(s) {
 		switch {

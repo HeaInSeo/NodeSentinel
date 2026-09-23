@@ -716,12 +716,19 @@ var errLegacyRetireSuperseded = errors.New("execution identity minted by another
 // "l5a-<id>-<attempt>", where <attempt> is a decimal integer. Current names
 // end in an execution ID, which starts with "a" (see sqlite.newExecutionID),
 // so they never match.
+//
+// Those workers truncated <id> to legacySanitizedIDMaxLen, not to the current
+// sanitizeDNSLabel length, so a long job ID must be matched in that form. The
+// current form is accepted too; both are only ever followed by a bare number
+// in a legacy name.
 func isLegacyJobName(name, jobID string) bool {
-	id := sanitizeDNSLabel(jobID)
-	for _, prefix := range []string{"smoke-", "l5a-"} {
-		attempt, ok := strings.CutPrefix(name, prefix+id+"-")
-		if ok && attempt != "" && strings.Trim(attempt, "0123456789") == "" {
-			return true
+	ids := []string{sanitizeDNSLabelMax(jobID, legacySanitizedIDMaxLen), sanitizeDNSLabel(jobID)}
+	for _, id := range ids {
+		for _, prefix := range []string{"smoke-", "l5a-"} {
+			attempt, ok := strings.CutPrefix(name, prefix+id+"-")
+			if ok && attempt != "" && strings.Trim(attempt, "0123456789") == "" {
+				return true
+			}
 		}
 	}
 	return false
