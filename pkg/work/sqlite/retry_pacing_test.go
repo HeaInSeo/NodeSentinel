@@ -85,7 +85,7 @@ func TestFailJob_Retryable_RequeuesWithDueTimeInSameWrite(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 3*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 3*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 
@@ -106,7 +106,7 @@ func TestLeaseJob_RetryNotBefore_SkipBeforeDueEligibleAtDue(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	first := mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 3*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 3*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	due := t0.Add(3 * time.Second)
@@ -137,7 +137,7 @@ func TestLeaseJob_RetryNotBefore_ComparedNumericallyAcrossPrecisionAndZone(t *te
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 3*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 3*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	// due = whole + 500ms
@@ -158,7 +158,7 @@ func TestLeaseJob_DelayedOldestDoesNotBlockDueJob(t *testing.T) {
 		t.Fatalf("CreateJob old: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-old", "worker-a", "transient", true, 30*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-old", "worker-a", 1, "transient", true, 30*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if _, err := store.CreateJob(ctx, sampleRequest("job-new")); err != nil {
@@ -184,14 +184,14 @@ func TestFailJob_DuplicateAndStaleCalls_ChangeNothing(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "first", true, 5*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "first", true, 5*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	afterFirst := mustGet(t, store, "job-a")
 
 	// Duplicate of the same report: the lease is already released.
 	clock.Set(t0.Add(time.Second))
-	if err := store.FailJob(ctx, "job-a", "worker-a", "duplicate", true, 20*time.Second); !errors.Is(err, work.ErrNotFound) {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "duplicate", true, 20*time.Second); !errors.Is(err, work.ErrNotFound) {
 		t.Fatalf("duplicate FailJob err = %v, want ErrNotFound", err)
 	}
 	if got := mustGet(t, store, "job-a"); !sameRow(got, afterFirst) {
@@ -202,7 +202,7 @@ func TestFailJob_DuplicateAndStaleCalls_ChangeNothing(t *testing.T) {
 	clock.Set(t0.Add(5 * time.Second))
 	mustLease(t, store, "worker-b")
 	leasedByB := mustGet(t, store, "job-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "stale", true, time.Second); !errors.Is(err, work.ErrNotFound) {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "stale", true, time.Second); !errors.Is(err, work.ErrNotFound) {
 		t.Fatalf("stale FailJob err = %v, want ErrNotFound", err)
 	}
 	if got := mustGet(t, store, "job-a"); !sameRow(got, leasedByB) {
@@ -210,15 +210,56 @@ func TestFailJob_DuplicateAndStaleCalls_ChangeNothing(t *testing.T) {
 	}
 
 	// A retryable report after the job is terminal must not requeue it.
-	if err := store.FailJob(ctx, "job-a", "worker-b", "deterministic", false, 0); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-b", 2, "deterministic", false, 0); err != nil {
 		t.Fatalf("terminal FailJob: %v", err)
 	}
 	terminal := mustGet(t, store, "job-a")
-	if err := store.FailJob(ctx, "job-a", "worker-b", "late retry", true, time.Second); !errors.Is(err, work.ErrNotFound) {
+	if err := store.FailJob(ctx, "job-a", "worker-b", 2, "late retry", true, time.Second); !errors.Is(err, work.ErrNotFound) {
 		t.Fatalf("FailJob on a failed job err = %v, want ErrNotFound", err)
 	}
 	if got := mustGet(t, store, "job-a"); !sameRow(got, terminal) || got.Status != work.StatusFailed {
 		t.Fatalf("late retryable FailJob changed a terminal job: %+v", got)
+	}
+}
+
+// TestFailJob_StaleAttemptSameWorkerName_ChangesNothing is the DQ-R2.1-N1
+// lease-generation case: the same worker name re-leases the job as attempt
+// n+1 after its lease on attempt n expired; a late FailJob for attempt n must
+// not touch the new lease, its status, or its due time.
+func TestFailJob_StaleAttemptSameWorkerName_ChangesNothing(t *testing.T) {
+	store, clock := newClockedStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-a")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	first, err := store.LeaseJob(ctx, "worker-a", time.Second)
+	if err != nil {
+		t.Fatalf("LeaseJob attempt 1: %v", err)
+	}
+	clock.Set(t0.Add(2 * time.Second)) // attempt 1's lease has expired
+	second := mustLease(t, store, "worker-a")
+	if second.Attempt != first.Attempt+1 || second.LeaseOwner != "worker-a" {
+		t.Fatalf("re-lease = (attempt %d, owner %q), want (attempt %d, worker-a)", second.Attempt, second.LeaseOwner, first.Attempt+1)
+	}
+	current := mustGet(t, store, "job-a")
+
+	for _, retryable := range []bool{true, false} {
+		err := store.FailJob(ctx, "job-a", "worker-a", first.Attempt, "stale attempt", retryable, 10*time.Second)
+		if !errors.Is(err, work.ErrNotFound) {
+			t.Fatalf("stale FailJob(retryable=%v) err = %v, want ErrNotFound", retryable, err)
+		}
+		if got := mustGet(t, store, "job-a"); !sameRow(got, current) {
+			t.Fatalf("stale FailJob(retryable=%v) changed the live lease:\nbefore %+v\nafter  %+v", retryable, current, got)
+		}
+	}
+
+	// The live generation can still fail its own attempt.
+	if err := store.FailJob(ctx, "job-a", "worker-a", second.Attempt, "transient", true, 3*time.Second); err != nil {
+		t.Fatalf("FailJob for the live attempt: %v", err)
+	}
+	if got := mustGet(t, store, "job-a"); got.Status != work.StatusQueued || got.RetryNotBefore == nil {
+		t.Fatalf("live FailJob: status=%q RetryNotBefore=%v, want queued with a due time", got.Status, got.RetryNotBefore)
 	}
 }
 
@@ -250,7 +291,7 @@ func TestRetryNotBefore_SurvivesReopen(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 20*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 20*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -287,7 +328,7 @@ func TestFailJob_Retry_PreservesExecutionIdentityAndDeliveryState(t *testing.T) 
 	}
 	before := mustGet(t, store, "job-a")
 
-	if err := store.FailJob(ctx, "job-a", "worker-a", "UNKNOWN [unknown-retry]", true, 2*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "UNKNOWN [unknown-retry]", true, 2*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	after := mustGet(t, store, "job-a")
@@ -325,7 +366,7 @@ func TestExpiredLeaseReclaim_NotGatedByRetryPacing(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 30*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 30*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	clock.Set(t0.Add(30 * time.Second))
@@ -357,7 +398,7 @@ func TestMigrateRetryNotBefore_ExistingRowsDueThenPacedOnNextFailure(t *testing.
 	}
 
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-old", "worker-a", "transient", true, 4*time.Second); err != nil {
+	if err := store.FailJob(ctx, "job-old", "worker-a", 1, "transient", true, 4*time.Second); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if got := mustGet(t, store, "job-old"); got.RetryNotBefore == nil || !got.RetryNotBefore.Equal(t0.Add(4*time.Second)) {
@@ -374,7 +415,7 @@ func TestFailJob_RetryableZeroDelay_DueImmediately(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	mustLease(t, store, "worker-a")
-	if err := store.FailJob(ctx, "job-a", "worker-a", "transient", true, 0); err != nil {
+	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "transient", true, 0); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if got := mustGet(t, store, "job-a"); got.RetryNotBefore != nil {

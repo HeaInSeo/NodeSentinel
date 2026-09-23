@@ -34,7 +34,7 @@ func (f failingStore) CompleteJob(context.Context, string, string, string) error
 	return errors.New("not implemented")
 }
 
-func (f failingStore) FailJob(context.Context, string, string, string, bool, time.Duration) error {
+func (f failingStore) FailJob(context.Context, string, string, int, string, bool, time.Duration) error {
 	return errors.New("not implemented")
 }
 

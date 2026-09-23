@@ -652,12 +652,16 @@ func (s *Store) CompleteJob(ctx context.Context, jobID, worker, resultSummary st
 }
 
 // FailJob implements work.Store. The retryable path requeues the job and sets
-// its retry_not_before in one UPDATE, fenced on the caller still holding a
-// live lease, so a requeued job is never visible without its due time and a
-// duplicate or stale call changes nothing.
-func (s *Store) FailJob(ctx context.Context, jobID, worker, lastError string, retryable bool, retryDelay time.Duration) error {
+// its retry_not_before in one UPDATE. Both paths are fenced on the caller's
+// lease generation — lease_owner plus the attempt LeaseJob handed out — so a
+// requeued job is never visible without its due time, and a duplicate call
+// or a stale call for an earlier attempt (even under the same worker name)
+// changes nothing.
+func (s *Store) FailJob(
+	ctx context.Context, jobID, worker string, attempt int, lastError string, retryable bool, retryDelay time.Duration,
+) error {
+	now := s.now().UTC()
 	if retryable {
-		now := s.now().UTC()
 		var retryNotBefore any // NULL: due immediately
 		if retryDelay > 0 {
 			retryNotBefore = now.Add(retryDelay).UnixNano()
@@ -665,7 +669,7 @@ func (s *Store) FailJob(ctx context.Context, jobID, worker, lastError string, re
 		const retrySQL = `
 UPDATE jobs
 SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, retry_not_before = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
+WHERE job_id = ? AND lease_owner = ? AND attempt = ? AND status IN (?, ?)
 `
 		res, err := s.db.ExecContext(
 			ctx,
@@ -676,6 +680,7 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 			now.Format(time.RFC3339Nano),
 			jobID,
 			worker,
+			attempt,
 			work.StatusLeased,
 			work.StatusRunning,
 		)
@@ -684,7 +689,25 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 		}
 		return ensureAffected(res)
 	}
-	return s.finishJob(ctx, jobID, worker, work.StatusFailed, lastError, "")
+	const failSQL = `
+UPDATE jobs
+SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, result_summary = '', updated_at = ?
+WHERE job_id = ? AND lease_owner = ? AND attempt = ?
+`
+	res, err := s.db.ExecContext(
+		ctx,
+		failSQL,
+		work.StatusFailed,
+		lastError,
+		now.Format(time.RFC3339Nano),
+		jobID,
+		worker,
+		attempt,
+	)
+	if err != nil {
+		return fmt.Errorf("fail job: %w", err)
+	}
+	return ensureAffected(res)
 }
 
 func (s *Store) finishJob(

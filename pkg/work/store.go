@@ -169,14 +169,16 @@ type Store interface {
 	LeaseJob(ctx context.Context, worker string, ttl time.Duration) (*Job, error)
 	Heartbeat(ctx context.Context, jobID, worker string, ttl time.Duration) error
 	CompleteJob(ctx context.Context, jobID, worker, resultSummary string) error
-	// FailJob records a failed attempt of a job leased by worker. When
-	// retryable, the job returns to Queued and, in the same write, becomes
-	// ineligible for LeaseJob until retryDelay has elapsed (retryDelay <= 0
-	// leaves it eligible immediately); otherwise it is marked Failed and
-	// retryDelay is ignored. It applies only while worker still holds the job's
-	// lease — a duplicate or stale call returns ErrNotFound and changes
-	// nothing. Execution identity and result-delivery state are untouched.
-	FailJob(ctx context.Context, jobID, worker, lastError string, retryable bool, retryDelay time.Duration) error
+	// FailJob records the failure of attempt, the Job.Attempt value LeaseJob
+	// returned to worker. When retryable, the job returns to Queued and, in the
+	// same write, becomes ineligible for LeaseJob until retryDelay has elapsed
+	// (retryDelay <= 0 leaves it eligible immediately); otherwise it is marked
+	// Failed and retryDelay is ignored. It applies only while worker still
+	// holds that same lease generation (owner and attempt): a duplicate call,
+	// or a stale one for an earlier attempt — even from the same worker name
+	// after it re-leased the job — returns ErrNotFound and changes nothing.
+	// Execution identity and result-delivery state are untouched.
+	FailJob(ctx context.Context, jobID, worker string, attempt int, lastError string, retryable bool, retryDelay time.Duration) error
 	GetJob(ctx context.Context, jobID string) (*Job, error)
 	ListJobs(ctx context.Context, status Status) ([]*Job, error)
 
