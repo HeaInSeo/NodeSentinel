@@ -580,6 +580,18 @@ func TestProcess_RejectedL4Create_ReleasesIdentity(t *testing.T) {
 // row and the L5-a check records sent to NodeVault.
 func runL5aWithFailedCreate(t *testing.T, jobID string, persist bool) (*work.Job, []capturedSubmission) {
 	t.Helper()
+	stored, l5a, _ := runL5aWithCreateReactor(t, jobID, func(kube *fake.Clientset) k8stesting.ReactionFunc {
+		return failRealCreate(kube, "l5a-", persist, errCreateTimedOut())
+	})
+	return stored, l5a
+}
+
+// runL5aWithCreateReactor is runL5aWithFailedCreate with the L5-a create
+// reactor supplied by the caller. It also returns the fake clientset.
+func runL5aWithCreateReactor(
+	t *testing.T, jobID string, createReactor func(*fake.Clientset) k8stesting.ReactionFunc,
+) (*work.Job, []capturedSubmission, *fake.Clientset) {
+	t.Helper()
 	useFastWorkerTicks(t)
 
 	var captured []capturedSubmission
@@ -587,7 +599,7 @@ func runL5aWithFailedCreate(t *testing.T, jobID string, persist bool) (*work.Job
 
 	store := newTestStore(t)
 	kube := fake.NewClientset()
-	kube.PrependReactor("create", "jobs", failRealCreate(kube, "l5a-", persist, errCreateTimedOut()))
+	kube.PrependReactor("create", "jobs", createReactor(kube))
 	kube.PrependReactor("create", "jobs", absorbDryRunReactor())
 	kube.PrependReactor("get", "jobs", completeIfStoredReactor(kube))
 
@@ -613,7 +625,18 @@ func runL5aWithFailedCreate(t *testing.T, jobID string, persist bool) (*work.Job
 			l5a = append(l5a, c)
 		}
 	}
-	return stored, l5a
+	return stored, l5a, kube
+}
+
+// l5aCreates returns the names of the real L5-a Job creates kube saw.
+func l5aCreates(kube *fake.Clientset) []string {
+	var names []string
+	for _, n := range realJobCreates(kube) {
+		if strings.HasPrefix(n, "l5a-") {
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 // TestRunL5a_AmbiguousCreate_JobPersisted_Adopts is the L5-a counterpart of
@@ -632,12 +655,94 @@ func TestRunL5a_AmbiguousCreate_JobPersisted_Adopts(t *testing.T) {
 	}
 }
 
-// TestRunL5a_AmbiguousCreate_NotFound_StaysAdoptable: the L5-a Create outcome
-// is unknown and the Job is not found, so the identity must not be released.
-func TestRunL5a_AmbiguousCreate_NotFound_StaysAdoptable(t *testing.T) {
-	stored, _ := runL5aWithFailedCreate(t, "l5a-ambiguous-missing", false)
+// TestRunL5a_AmbiguousCreate_OutcomeStaysUnknown: every L5-a Create, the
+// first and each same-name reconcile, times out without storing the Job.
+// Nothing re-observes L5-a after the job completes, so the identity is left
+// non-terminal (a late Job may still land) and the record must say the
+// outcome is unknown rather than that creation failed.
+func TestRunL5a_AmbiguousCreate_OutcomeStaysUnknown(t *testing.T) {
+	stored, l5a, kube := runL5aWithCreateReactor(t, "l5a-ambiguous-missing", func(kube *fake.Clientset) k8stesting.ReactionFunc {
+		return failRealCreate(kube, "l5a-", false, errCreateTimedOut())
+	})
+	creates := l5aCreates(kube)
+	if len(creates) != 1+l5aCreateReconcileAttempts {
+		t.Fatalf("L5-a creates = %v, want the first create plus %d reconcile creates", creates, l5aCreateReconcileAttempts)
+	}
+	for _, n := range creates {
+		if n != creates[0] {
+			t.Fatalf("L5-a creates = %v, want every reconcile under the same name", creates)
+		}
+	}
 	if stored.ExecutionTerminal {
 		t.Fatal("identity released after an L5-a create whose outcome is unknown")
+	}
+	if len(l5a) != 1 {
+		t.Fatalf("L5-a check records = %d, want 1", len(l5a))
+	}
+	if reason := l5a[0].decodeCheck(t).FailureReason; !strings.Contains(reason, "outcome unknown") {
+		t.Fatalf("L5-a FailureReason = %q, want it to say the create outcome is unknown", reason)
+	}
+}
+
+// TestRunL5a_AmbiguousCreate_ReconcileCreates: the first L5-a Create times
+// out without storing the Job and the same-name reconcile Create succeeds.
+// L5-a is then observed to completion and the identity released, with one
+// Job in the cluster.
+func TestRunL5a_AmbiguousCreate_ReconcileCreates(t *testing.T) {
+	stored, l5a, kube := runL5aWithCreateReactor(t, "l5a-ambiguous-reconciled", func(kube *fake.Clientset) k8stesting.ReactionFunc {
+		failFirst := failRealCreate(kube, "l5a-", false, errCreateTimedOut())
+		var failedOnce atomic.Bool
+		return func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if failedOnce.Load() {
+				return false, nil, nil
+			}
+			handled, obj, err := failFirst(action)
+			if handled {
+				failedOnce.Store(true)
+			}
+			return handled, obj, err
+		}
+	})
+	if creates := l5aCreates(kube); len(creates) != 2 || creates[0] != creates[1] {
+		t.Fatalf("L5-a creates = %v, want the timed-out create and one reconcile under the same name", creates)
+	}
+	if len(l5a) != 1 {
+		t.Fatalf("L5-a check records = %d, want 1", len(l5a))
+	}
+	if got := l5a[0].decodeCheck(t).ValidationStatus; got != "succeeded" {
+		t.Fatalf("L5-a ValidationStatus = %q, want succeeded from observing the reconciled Job", got)
+	}
+	if !stored.ExecutionTerminal {
+		t.Error("identity should be released once the reconciled L5-a Job reached a terminal condition")
+	}
+}
+
+// TestMarkExecutionTerminal_StaleWorkerDoesNotReleaseReplacement: a worker
+// still holding execution E1 reports it terminal after another worker minted
+// E2. The report must leave E2 adoptable, or the next attempt mints a third
+// execution beside E2's running Job.
+func TestMarkExecutionTerminal_StaleWorkerDoesNotReleaseReplacement(t *testing.T) {
+	store := newTestStore(t)
+	stale := leaseAndMint(t, store, "stale-worker")
+	w := New(store, fake.NewClientset(), "test-worker")
+
+	// Another worker observed E1 terminal and minted E2.
+	current := *stale
+	w.markExecutionTerminal(context.Background(), slog.Default(), &current)
+	e2, adopted, err := store.EnsureExecution(context.Background(), stale.JobID, "other-worker")
+	if err != nil || adopted || e2 == stale.ExecutionID {
+		t.Fatalf("EnsureExecution = %q, adopted=%v, err=%v; want a fresh E2", e2, adopted, err)
+	}
+
+	w.markExecutionTerminal(context.Background(), slog.Default(), stale)
+
+	stored, err := store.GetJob(context.Background(), stale.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ExecutionID != e2 || stored.ExecutionTerminal {
+		t.Fatalf("execution %q terminal=%v after the stale E1 report, want E2 %q non-terminal",
+			stored.ExecutionID, stored.ExecutionTerminal, e2)
 	}
 }
 

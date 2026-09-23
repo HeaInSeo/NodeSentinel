@@ -16,6 +16,12 @@ var (
 	// validation_request_id is only valid for retrying the exact same
 	// logical request — see EnqueueValidationWorkRequest.validation_request_id.
 	ErrValidationRequestConflict = errors.New("workstore: validation_request_id already used with a different request")
+
+	// ErrExecutionSuperseded is returned by MarkExecutionTerminal when the
+	// job's current execution identity is not the one the caller observed:
+	// a newer execution has replaced it, and it must not be released by a
+	// report about the older one.
+	ErrExecutionSuperseded = errors.New("workstore: execution identity superseded")
 )
 
 type Status string
@@ -217,17 +223,25 @@ type Store interface {
 	// jobID does not exist.
 	EnsureExecution(ctx context.Context, jobID, worker string) (executionID string, adopted bool, err error)
 
-	// MarkExecutionTerminal records that jobID's current ExecutionID has
-	// reached a terminal state — it completed, failed, or was observed to no
-	// longer exist. It is the only thing that re-enables minting a new
-	// execution identity on a later attempt (see EnsureExecution).
+	// MarkExecutionTerminal records that executionID, the execution the
+	// caller observed for jobID, has reached a terminal state — it
+	// completed, failed, or was observed to no longer exist. It is the only
+	// thing that re-enables minting a new execution identity on a later
+	// attempt (see EnsureExecution).
 	//
 	// Callers must only invoke this once the physical execution is known not
 	// to be running: a Complete/Failed Job condition, or a NotFound on the
 	// Job object itself. Calling it while the Job may still be running would
-	// reopen the duplicate-execution hole EnsureExecution closes. Returns
-	// ErrNotFound if jobID does not exist.
-	MarkExecutionTerminal(ctx context.Context, jobID string) error
+	// reopen the duplicate-execution hole EnsureExecution closes.
+	//
+	// The update applies only while executionID is still jobID's current
+	// identity. A worker that resumes after its lease expired may report on
+	// an execution another worker has already replaced; releasing by jobID
+	// alone would mark the replacement terminal while its Job runs, and the
+	// next attempt would mint a third beside it. Such a stale report returns
+	// ErrExecutionSuperseded and changes nothing. Returns ErrNotFound if
+	// jobID does not exist.
+	MarkExecutionTerminal(ctx context.Context, jobID, executionID string) error
 
 	// ClaimTerminal atomically claims jobID's one-time terminal-submission
 	// slot: the first caller for a given job gets claimed=true and is the

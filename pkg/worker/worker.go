@@ -231,7 +231,7 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 		// so release it. Leaving it adoptable would make the next attempt skip
 		// both the dry-run and the Create, observe a Job that never existed,
 		// and spend a retry on the resulting NotFound.
-		w.markExecutionTerminal(ctx, logger, job.JobID)
+		w.markExecutionTerminal(ctx, logger, job)
 		decision := decideRetry(FailureClassTransientInfra, job, "L3 dry-run: "+err.Error())
 		w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
 		w.reportTerminalFailure(ctx, logger, job, vaultclient.StageL3, "kubectl apply --dry-run", decision)
@@ -503,6 +503,11 @@ func (w *Worker) runSmokeRun(
 	// Job. Until then, NotFound for an adopted identity proves nothing. The
 	// attempt that minted it may have had an ambiguous Create that is still
 	// executing server-side (see the poll loop).
+	//
+	// confirmed is per call, not persisted. If an earlier attempt saw the
+	// Job complete and then died before releasing the identity, the Job may
+	// since have been deleted, so this attempt re-creates it and L4 runs
+	// again. That re-run is sequential, never concurrent: at-least-once.
 	confirmed := !adopted
 
 	// Poll until Job completes, context expires, or deadline exceeds.
@@ -519,7 +524,7 @@ func (w *Worker) runSmokeRun(
 			// confirmed gone — otherwise the Job may well still be executing
 			// and the next attempt must adopt it, not race it.
 			if err := w.deleteAndConfirmGone(ns, name); err == nil {
-				w.markExecutionTerminal(context.Background(), logger, job.JobID)
+				w.markExecutionTerminal(context.Background(), logger, job)
 			} else {
 				logger.Warn("L4: smoke-run Job not confirmed gone on context end — "+
 					"leaving execution adoptable rather than risking a duplicate", "k8s_job", name, "err", err)
@@ -553,7 +558,7 @@ func (w *Worker) runSmokeRun(
 				// so release the identity and let the next attempt mint a
 				// fresh one. Retryable because no outcome was ever observed
 				// for this execution.
-				w.markExecutionTerminal(ctx, logger, job.JobID)
+				w.markExecutionTerminal(ctx, logger, job)
 				return outcome{success: false, retryable: true, class: FailureClassUnknown,
 					reason: "smoke-run Job no longer exists; outcome was never observed"}
 			}
@@ -568,14 +573,14 @@ func (w *Worker) runSmokeRun(
 			for _, cond := range k8sJob.Status.Conditions {
 				if cond.Type == "Complete" && cond.Status == "True" {
 					if releaseOnSuccess {
-						w.markExecutionTerminal(ctx, logger, job.JobID)
+						w.markExecutionTerminal(ctx, logger, job)
 					}
 					_ = w.deleteJob(context.Background(), ns, name)
 					return outcome{success: true}
 				}
 				if cond.Type == "Failed" && cond.Status == "True" {
 					result := classifySmokeRun(ctx, w.kube, ns, name, k8sJob)
-					w.markExecutionTerminal(ctx, logger, job.JobID)
+					w.markExecutionTerminal(ctx, logger, job)
 					_ = w.deleteJob(context.Background(), ns, name)
 					return result
 				}
@@ -618,7 +623,7 @@ func (w *Worker) createSmokeJob(
 		// this identity. Release it rather than stranding the job: leaving
 		// it non-terminal would make every later attempt try to adopt a
 		// Job that was never created.
-		w.markExecutionTerminal(ctx, logger, job.JobID)
+		w.markExecutionTerminal(ctx, logger, job)
 		return &outcome{success: false, retryable: true, class: FailureClassTransientInfra,
 			reason: "failed to create smoke-run Job: " + err.Error()}
 	case err != nil:
@@ -682,15 +687,21 @@ func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger
 	return nil
 }
 
-// markExecutionTerminal releases jobID's execution identity, logging rather
-// than propagating a store failure: every caller is already on a path that
-// returns its own outcome, and a failure here is self-correcting — the
-// identity simply stays adoptable, so the next attempt re-observes a Job
-// that has already finished and reaches the same terminal conclusion. That
-// is the safe direction to fail in; the unsafe direction would be releasing
-// an identity whose Job is still running.
-func (w *Worker) markExecutionTerminal(ctx context.Context, logger *slog.Logger, jobID string) {
-	if err := w.store.MarkExecutionTerminal(ctx, jobID); err != nil {
+// markExecutionTerminal releases job's execution identity — the one this
+// attempt observed, job.ExecutionID — logging rather than propagating a
+// store failure: every caller is already on a path that returns its own
+// outcome, and a failure here is self-correcting — the identity simply stays
+// adoptable, so the next attempt re-observes a Job that has already finished
+// and reaches the same terminal conclusion. That is the safe direction to
+// fail in; the unsafe direction would be releasing an identity whose Job is
+// still running. The store refuses the release if another worker has since
+// replaced this execution (work.ErrExecutionSuperseded).
+func (w *Worker) markExecutionTerminal(ctx context.Context, logger *slog.Logger, job *work.Job) {
+	err := w.store.MarkExecutionTerminal(ctx, job.JobID, job.ExecutionID)
+	switch {
+	case errors.Is(err, work.ErrExecutionSuperseded):
+		logger.Warn("execution was replaced by another worker — not releasing the replacement", "err", err)
+	case err != nil:
 		logger.Warn("could not mark execution terminal — it stays adoptable for the next attempt", "err", err)
 	}
 }
@@ -813,8 +824,6 @@ func (w *Worker) deleteAndConfirmGone(ns, name string) error {
 	}
 }
 
-// jobExists reports whether Job name exists. A non-NotFound API error is
-// returned as-is: the caller cannot tell either way.
 // createRejected reports whether err, returned by a Job Create, proves the
 // API server refused the object so that nothing was persisted. Any other
 // error (a timeout, a 5xx, a lost response) leaves the outcome unknown: the
@@ -827,6 +836,8 @@ func createRejected(err error) bool {
 		apierrors.IsRequestEntityTooLargeError(err) || apierrors.IsTooManyRequests(err)
 }
 
+// jobExists reports whether Job name exists. A non-NotFound API error is
+// returned as-is: the caller cannot tell either way.
 func (w *Worker) jobExists(ctx context.Context, ns, name string) (bool, error) {
 	_, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 	switch {

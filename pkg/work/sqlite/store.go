@@ -976,14 +976,18 @@ func newExecutionID(attempt int) (string, error) {
 // poll that also ends the run). It does require a non-empty execution_id —
 // there is nothing to mark terminal before one is minted, and matching such
 // a row would let a later EnsureExecution believe an execution had run.
-func (s *Store) MarkExecutionTerminal(ctx context.Context, jobID string) error {
+//
+// The WHERE clause also matches the caller's observed execution_id, so a
+// stale worker's report about a replaced execution cannot release the
+// replacement (see work.Store.MarkExecutionTerminal).
+func (s *Store) MarkExecutionTerminal(ctx context.Context, jobID, executionID string) error {
 	now := time.Now().UTC()
 	const q = `
 UPDATE jobs
 SET execution_terminal = 1, updated_at = ?
-WHERE job_id = ? AND execution_id != ''
+WHERE job_id = ? AND execution_id = ? AND execution_id != ''
 `
-	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
+	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID, executionID)
 	if err != nil {
 		return fmt.Errorf("mark execution terminal: %w", err)
 	}
@@ -995,15 +999,20 @@ WHERE job_id = ? AND execution_id != ''
 		return nil
 	}
 
-	exists, err := s.jobExists(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if !exists {
+	var current string
+	err = s.db.QueryRowContext(ctx, `SELECT execution_id FROM jobs WHERE job_id = ?`, jobID).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
 		return work.ErrNotFound
 	}
-	// The job exists but has no execution identity yet — nothing to mark.
-	return nil
+	if err != nil {
+		return fmt.Errorf("select execution identity: %w", err)
+	}
+	if current == "" {
+		// The job has no execution identity yet — nothing to mark.
+		return nil
+	}
+	return fmt.Errorf("%w: job %s is on execution %q, not %q",
+		work.ErrExecutionSuperseded, jobID, current, executionID)
 }
 
 // jobExists reports whether jobID has a row in the jobs table.

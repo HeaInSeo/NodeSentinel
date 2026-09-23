@@ -126,30 +126,35 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		// the duplicate execution the identity scheme exists to prevent.
 		logger.Info("L5-a validation Job already exists — adopting", "k8s_job", jobSpec.Name)
 		created = jobSpec
-	case err != nil:
+	case err != nil && createRejected(err):
+		// Nothing runs under this identity any more: L4 has finished and
+		// the L5-a Job was never created. process() left the identity open
+		// for L5-a (see l5aFollows), so release it here.
 		logger.Warn("L5-a job creation failed", "err", err)
-		if createRejected(err) {
-			// Nothing runs under this identity any more: L4 has finished and
-			// the L5-a Job was never created. process() left the identity
-			// open for L5-a (see l5aFollows), so release it here.
-			w.markExecutionTerminal(ctx, logger, job.JobID)
-		} else {
-			// The Create may have been persisted despite the error (see
-			// runSmokeRun). Adopt the deterministic name if it exists;
-			// otherwise leave the identity adoptable instead of releasing it
-			// while a Job may be running.
-			found, getErr := w.jobExists(l5aCtx, smokeNamespace, jobSpec.Name)
-			if getErr == nil && found {
-				logger.Info("L5-a validation Job exists despite create error — adopting", "k8s_job", jobSpec.Name)
-				created = jobSpec
-				break
-			}
-			logger.Warn("L5-a: validation Job create outcome unknown — leaving execution adoptable",
-				"k8s_job", jobSpec.Name, "get_err", getErr)
-		}
+		w.markExecutionTerminal(ctx, logger, job)
 		w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, err.Error())
 		return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
 			outcome{class: FailureClassTransientInfra, reason: "infra-level: job creation failed: " + err.Error()}))
+	case err != nil:
+		// The Create may have been persisted despite the error (see
+		// runSmokeRun). Unlike L4, nothing retries this stage: process()
+		// completes the job whatever runL5a returns, so an identity left
+		// adoptable here is never observed again. Settle the outcome now.
+		logger.Warn("L5-a job create outcome unknown — reconciling under the same name", "err", err)
+		if !w.reconcileL5aCreate(l5aCtx, logger, jobSpec) {
+			// Still unknown. The identity stays non-terminal because a Job
+			// may yet run under it, and the record says the outcome is
+			// unknown rather than that creation failed. If the Job does
+			// land, it runs unobserved; ActiveDeadlineSeconds bounds it and
+			// TTLSecondsAfterFinished reaps it.
+			reason := "infra-level: L5-a Job create outcome unknown; a late Job would run unobserved: " + err.Error()
+			logger.Warn("L5-a: validation Job create outcome still unknown — leaving execution non-terminal",
+				"k8s_job", jobSpec.Name)
+			w.noteClassification(logger, vaultclient.StageL5A, FailureClassTransientInfra, reason)
+			return w.submitCheckRecord(ctx, logger, job, l5aFailureSubmission(checkID, command, terminal, 0, 0,
+				outcome{class: FailureClassTransientInfra, reason: reason}))
+		}
+		created = jobSpec
 	default:
 		logger.Info("L5-a validation Job created", "k8s_job", created.Name)
 	}
@@ -181,6 +186,42 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		checkID: checkID, stage: vaultclient.StageL5A, terminal: terminal, command: command, exitCode: exitCode, durationSec: durationSec,
 		validationStatus: "succeeded",
 	})
+}
+
+// l5aCreateReconcileAttempts bounds how many times reconcileL5aCreate
+// re-issues an L5-a Create whose outcome is unknown. A var so tests can lower
+// it.
+var l5aCreateReconcileAttempts = 3
+
+// reconcileL5aCreate settles an L5-a Create whose outcome is unknown by
+// re-issuing it under the same deterministic name, pollFrequency apart. It
+// reports true once a Job exists under that name: this call created it, or
+// AlreadyExists shows the original Create landed. The name is the
+// idempotency key, so at most one of the requests creates a Job. A rejected
+// re-create proves nothing about the original request, so it is retried like
+// any other error. Returns false when ctx ends or the attempts run out.
+func (w *Worker) reconcileL5aCreate(ctx context.Context, logger *slog.Logger, jobSpec *batchv1.Job) bool {
+	for i := 0; i < l5aCreateReconcileAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(pollFrequency):
+			}
+		}
+		_, err := w.kube.BatchV1().Jobs(smokeNamespace).Create(ctx, jobSpec, metav1.CreateOptions{})
+		switch {
+		case err == nil:
+			logger.Info("L5-a validation Job created on reconcile", "k8s_job", jobSpec.Name)
+			return true
+		case apierrors.IsAlreadyExists(err):
+			logger.Info("L5-a validation Job exists despite create error — adopting", "k8s_job", jobSpec.Name)
+			return true
+		default:
+			logger.Warn("L5-a: reconcile create failed", "k8s_job", jobSpec.Name, "attempt", i+1, "err", err)
+		}
+	}
+	return false
 }
 
 // l5aFailureSubmission builds the checkRecordSubmission for an L5-a failure
@@ -249,7 +290,7 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 		select {
 		case <-ctx.Done():
 			if err := w.deleteAndConfirmGone(smokeNamespace, jobName); err == nil {
-				w.markExecutionTerminal(context.Background(), logger, job.JobID)
+				w.markExecutionTerminal(context.Background(), logger, job)
 			} else {
 				logger.Warn("L5-a: validation Job not confirmed gone after timeout — "+
 					"leaving execution adoptable rather than risking a duplicate", "k8s_job", jobName, "err", err)
@@ -269,12 +310,12 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 			for _, cond := range k8sJob.Status.Conditions {
 				switch {
 				case cond.Type == "Complete" && cond.Status == "True":
-					w.markExecutionTerminal(ctx, logger, job.JobID)
+					w.markExecutionTerminal(ctx, logger, job)
 					return 0, outcome{success: true}, nil
 				case cond.Type == "Failed" && cond.Status == "True":
 					result := classifyFromPods(ctx, w.kube, smokeNamespace, jobName, cond.Reason, cond.Message)
 					code := w.extractPodExitCode(ctx, jobName)
-					w.markExecutionTerminal(ctx, logger, job.JobID)
+					w.markExecutionTerminal(ctx, logger, job)
 					return code, result, fmt.Errorf("job failed: %s", cond.Message)
 				}
 			}

@@ -70,7 +70,7 @@ func (f failingStore) EnsureExecution(context.Context, string, string) (string, 
 	return "", false, errors.New("not implemented")
 }
 
-func (f failingStore) MarkExecutionTerminal(context.Context, string) error {
+func (f failingStore) MarkExecutionTerminal(context.Context, string, string) error {
 	return errors.New("not implemented")
 }
 

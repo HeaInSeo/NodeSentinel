@@ -58,7 +58,7 @@ func TestEnsureExecution_AdoptsUntilTerminal(t *testing.T) {
 	}
 
 	// Once the execution is observed terminal, a new one may be minted.
-	if err := store.MarkExecutionTerminal(ctx, "job-exec"); err != nil {
+	if err := store.MarkExecutionTerminal(ctx, "job-exec", first); err != nil {
 		t.Fatalf("MarkExecutionTerminal: %v", err)
 	}
 	third, adopted, err := store.EnsureExecution(ctx, "job-exec", "worker-3")
@@ -135,7 +135,7 @@ func TestMarkExecutionTerminal_UnknownAndUnmintedJobs(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
 
-	if err := store.MarkExecutionTerminal(ctx, "no-such-job"); !errors.Is(err, work.ErrNotFound) {
+	if err := store.MarkExecutionTerminal(ctx, "no-such-job", "a1-0000000000000000"); !errors.Is(err, work.ErrNotFound) {
 		t.Fatalf("MarkExecutionTerminal on a missing job = %v, want ErrNotFound", err)
 	}
 
@@ -144,7 +144,7 @@ func TestMarkExecutionTerminal_UnknownAndUnmintedJobs(t *testing.T) {
 	if _, err := store.CreateJob(ctx, sampleRequest("job-unminted")); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := store.MarkExecutionTerminal(ctx, "job-unminted"); err != nil {
+	if err := store.MarkExecutionTerminal(ctx, "job-unminted", ""); err != nil {
 		t.Fatalf("MarkExecutionTerminal on an unminted job = %v, want nil", err)
 	}
 
@@ -163,6 +163,61 @@ func TestMarkExecutionTerminal_UnknownAndUnmintedJobs(t *testing.T) {
 		t.Fatalf("EnsureExecution: %v", err)
 	} else if adopted {
 		t.Fatal("a job with no execution identity must mint one, not adopt")
+	}
+}
+
+// TestMarkExecutionTerminal_StaleExecutionCannotReleaseReplacement: a worker
+// resumes after its lease expired and reports its execution E1 terminal, but
+// another worker has already observed E1 terminal and minted E2. The stale
+// report must leave E2 non-terminal. Otherwise the next attempt mints E3
+// while E2's Job is still running.
+func TestMarkExecutionTerminal_StaleExecutionCannotReleaseReplacement(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, sampleRequest("job-stale")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	e1, _, err := store.EnsureExecution(ctx, "job-stale", "worker-1")
+	if err != nil {
+		t.Fatalf("EnsureExecution (E1): %v", err)
+	}
+	// Worker 2 adopted E1, observed it terminal and minted E2.
+	if err := store.MarkExecutionTerminal(ctx, "job-stale", e1); err != nil {
+		t.Fatalf("MarkExecutionTerminal (E1 by worker 2): %v", err)
+	}
+	e2, adopted, err := store.EnsureExecution(ctx, "job-stale", "worker-2")
+	if err != nil {
+		t.Fatalf("EnsureExecution (E2): %v", err)
+	}
+	if adopted || e2 == e1 {
+		t.Fatalf("E2 = %q (adopted=%v), want a fresh identity distinct from E1 %q", e2, adopted, e1)
+	}
+
+	// The stale worker 1 now reports E1 terminal.
+	if err := store.MarkExecutionTerminal(ctx, "job-stale", e1); !errors.Is(err, work.ErrExecutionSuperseded) {
+		t.Fatalf("stale MarkExecutionTerminal(E1) = %v, want ErrExecutionSuperseded", err)
+	}
+	stored, err := store.GetJob(ctx, "job-stale")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if stored.ExecutionID != e2 || stored.ExecutionTerminal {
+		t.Fatalf("after stale E1 report: execution %q terminal=%v, want E2 %q still non-terminal",
+			stored.ExecutionID, stored.ExecutionTerminal, e2)
+	}
+	e3, adopted, err := store.EnsureExecution(ctx, "job-stale", "worker-3")
+	if err != nil {
+		t.Fatalf("EnsureExecution (next attempt): %v", err)
+	}
+	if !adopted || e3 != e2 {
+		t.Fatalf("next attempt got %q (adopted=%v), want to adopt running E2 %q — a fresh identity "+
+			"here is a second concurrent Job", e3, adopted, e2)
+	}
+
+	// The current holder can still release E2.
+	if err := store.MarkExecutionTerminal(ctx, "job-stale", e2); err != nil {
+		t.Fatalf("MarkExecutionTerminal (E2): %v", err)
 	}
 }
 
