@@ -87,7 +87,7 @@ func TestRetryableFailureReturnsJobToQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LeaseJob: %v", err)
 	}
-	if err := store.FailJob(ctx, leased.JobID, "worker-a", "temporary timeout", true); err != nil {
+	if err := store.FailJob(ctx, leased.JobID, "worker-a", leased.Attempt, "temporary timeout", true, 0); err != nil {
 		t.Fatalf("FailJob retryable: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestNonRetryableFailureMarksJobFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LeaseJob: %v", err)
 	}
-	if err := store.FailJob(ctx, leased.JobID, "worker-a", "contract failed", false); err != nil {
+	if err := store.FailJob(ctx, leased.JobID, "worker-a", leased.Attempt, "contract failed", false, 0); err != nil {
 		t.Fatalf("FailJob non-retryable: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestWrongWorkerCannotFailJob(t *testing.T) {
 		t.Fatalf("LeaseJob: %v", err)
 	}
 
-	err = store.FailJob(ctx, leased.JobID, "worker-b", "wrong owner", false)
+	err = store.FailJob(ctx, leased.JobID, "worker-b", leased.Attempt, "wrong owner", false, 0)
 	if err != work.ErrNotFound {
 		t.Fatalf("FailJob wrong worker err = %v, want %v", err, work.ErrNotFound)
 	}

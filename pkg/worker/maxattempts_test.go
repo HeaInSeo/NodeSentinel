@@ -581,7 +581,7 @@ func TestRunSmokeRun_RetryAfterGetFailure_AdoptsInsteadOfDuplicating(t *testing.
 	// ErrNoAvailableJob and the test would never reach the duplicate-Job
 	// assertion it exists for.
 	if err := store.FailJob(
-		context.Background(), job1.JobID, "worker-1", result1.reason, true,
+		context.Background(), job1.JobID, "worker-1", job1.Attempt, result1.reason, true, 0,
 	); err != nil {
 		t.Fatalf("FailJob (requeue after attempt 1): %v", err)
 	}

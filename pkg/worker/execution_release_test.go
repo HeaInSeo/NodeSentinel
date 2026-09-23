@@ -209,7 +209,7 @@ func TestProcess_AdoptedDuringL5a_ObservesL5aInsteadOfRerunning(t *testing.T) {
 	); err != nil {
 		t.Fatalf("seed running L5-a Job: %v", err)
 	}
-	if err := store.FailJob(context.Background(), job1.JobID, "worker-1", "lease expired", true); err != nil {
+	if err := store.FailJob(context.Background(), job1.JobID, "worker-1", job1.Attempt, "lease expired", true, 0); err != nil {
 		t.Fatalf("FailJob (requeue): %v", err)
 	}
 	kube.ClearActions()
@@ -343,7 +343,7 @@ func seedLegacyInFlightJobWithPrefix(t *testing.T, store work.Store, kube *fake.
 	); err != nil {
 		t.Fatalf("seed legacy Job: %v", err)
 	}
-	if err := store.FailJob(context.Background(), jobID, "legacy-worker", "lease expired", true); err != nil {
+	if err := store.FailJob(context.Background(), jobID, "legacy-worker", legacy.Attempt, "lease expired", true, 0); err != nil {
 		t.Fatalf("FailJob (requeue): %v", err)
 	}
 	kube.ClearActions()
@@ -492,7 +492,7 @@ func staleSnapshotAfterReplacement(t *testing.T, store work.Store, kube *fake.Cl
 		t.Fatalf("setup: stale ExecutionID = %q, want empty", stale.ExecutionID)
 	}
 	// Stands in for lease expiry: the row becomes leasable by another worker.
-	if err := store.FailJob(ctx, jobID, "stale-worker", "lease expired", true); err != nil {
+	if err := store.FailJob(ctx, jobID, "stale-worker", stale.Attempt, "lease expired", true, 0); err != nil {
 		t.Fatalf("FailJob (requeue): %v", err)
 	}
 	replacement, err := store.LeaseJob(ctx, "replacement-worker", 60*time.Second)
