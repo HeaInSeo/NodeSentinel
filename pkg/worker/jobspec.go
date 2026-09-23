@@ -110,15 +110,27 @@ func sanitizeDNSLabel(s string) string {
 	// 22 even allowing a 4-digit attempt) = 29 chars of overhead. 63-29=34,
 	// so 30 leaves headroom. This was 50 back when the suffix was a bare
 	// attempt number; keeping 50 would now overflow the limit and make the
-	// API server reject every Job for a long job ID.
+	// API server reject every Job for a long job ID. Only Job names carry
+	// this budget; NodeVault record IDs use recordIDLabel.
 	return sanitizeDNSLabelMax(s, 30)
 }
 
-// legacySanitizedIDMaxLen is the truncation workers without execution
-// identities applied to the job ID in their attempt-derived Job names. Only
-// isLegacyJobName may use it: recognizing those names needs the historical
-// form, and a normal ingress ID ("job-" + 32 hex) is longer than 30.
+// legacySanitizedIDMaxLen is the historical job-ID truncation: workers
+// without execution identities applied it in their attempt-derived Job names,
+// and every NodeVault record ID (CheckID, ScanID) has always used it. Job
+// names must not use it (see sanitizeDNSLabel); isLegacyJobName and
+// recordIDLabel must, because a normal ingress ID ("job-" + 32 hex) is longer
+// than 30.
 const legacySanitizedIDMaxLen = 50
+
+// recordIDLabel returns the job-ID part of a NodeVault CheckID or ScanID. It
+// keeps the historical truncation rather than the Job-name one: record IDs
+// are not bound by the DNS label budget, and NodeVault matches a resubmitted
+// check by ID, so a record ID that changed across an upgrade would duplicate
+// an in-flight job's evidence instead of hitting its idempotency check.
+func recordIDLabel(jobID string) string {
+	return sanitizeDNSLabelMax(jobID, legacySanitizedIDMaxLen)
+}
 
 // sanitizeDNSLabelMax is sanitizeDNSLabel with an explicit truncation length.
 func sanitizeDNSLabelMax(s string, maxLen int) string {

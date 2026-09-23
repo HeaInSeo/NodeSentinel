@@ -106,7 +106,7 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 		return nil
 	}
 
-	checkID := fmt.Sprintf("l5a-%s", sanitizeDNSLabel(job.JobID))
+	checkID := fmt.Sprintf("l5a-%s", recordIDLabel(job.JobID))
 	command := l5aCommand
 	startedAt := time.Now()
 

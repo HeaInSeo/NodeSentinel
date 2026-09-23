@@ -367,7 +367,7 @@ func (w *Worker) reportTerminalFailure(
 	}
 	validationStatus, failureKind := decision.Class.wireStatus()
 	sub := checkRecordSubmission{
-		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
+		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), recordIDLabel(job.JobID)),
 		stage:            stage,
 		terminal:         !decision.Retry,
 		command:          command,
@@ -425,7 +425,7 @@ func (w *Worker) reportTerminalSuccess(ctx context.Context, logger *slog.Logger,
 		return
 	}
 	sub := checkRecordSubmission{
-		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), sanitizeDNSLabel(job.JobID)),
+		checkID:          fmt.Sprintf("%s-%s", stageCheckIDPrefix(stage), recordIDLabel(job.JobID)),
 		stage:            stage,
 		terminal:         true,
 		command:          command,
