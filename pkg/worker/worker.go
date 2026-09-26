@@ -314,7 +314,7 @@ func (w *Worker) finishAfterL4(ctx context.Context, logger *slog.Logger, job *wo
 	default:
 		summary += "; L5-b skipped (not requested)"
 	}
-	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, summary); err != nil {
+	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, job.Attempt, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
 	}
 	w.incJobsCompleted()
@@ -532,7 +532,7 @@ func (w *Worker) runSmokeRun(
 			}
 			return classifySmokeRun(ctx, w.kube, ns, name, &batchv1.Job{})
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
+			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration); err != nil {
 				logger.Warn("Heartbeat failed", "err", err)
 			}
 		case <-pollTick.C:
@@ -699,7 +699,7 @@ func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger
 		}
 		// Each confirmation can take up to deletionConfirmWait. Extend the
 		// lease so a slow retirement cannot let another worker reclaim the job.
-		if hbErr := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); hbErr != nil {
+		if hbErr := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration); hbErr != nil {
 			logger.Warn("Heartbeat failed", "err", hbErr)
 		}
 	}

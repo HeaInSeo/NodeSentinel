@@ -298,7 +298,7 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 			result := outcome{class: FailureClassTransientInfra, reason: "L5-a timeout: job did not complete within allotted time"}
 			return 0, result, errors.New(result.reason)
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
+			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration); err != nil {
 				logger.Warn("L5-a heartbeat failed", "err", err)
 			}
 		case <-pollTick.C:
