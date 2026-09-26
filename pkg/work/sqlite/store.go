@@ -622,13 +622,16 @@ WHERE job_id = ?
 	return s.GetJob(ctx, jobID)
 }
 
-func (s *Store) Heartbeat(ctx context.Context, jobID, worker string, ttl time.Duration) error {
+// Heartbeat implements work.Store. It is fenced on lease_owner plus attempt,
+// matching FailJob: after an expired lease was reclaimed, the previous
+// attempt's heartbeat — even under the same worker name — matches no row.
+func (s *Store) Heartbeat(ctx context.Context, jobID, worker string, attempt int, ttl time.Duration) error {
 	now := time.Now().UTC()
 	leaseUntil := now.Add(ttl).UTC().Format(time.RFC3339Nano)
 	const updateSQL = `
 UPDATE jobs
 SET status = ?, lease_until = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
+WHERE job_id = ? AND lease_owner = ? AND attempt = ? AND status IN (?, ?)
 `
 	res, err := s.db.ExecContext(
 		ctx,
@@ -638,6 +641,7 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 		now.Format(time.RFC3339Nano),
 		jobID,
 		worker,
+		attempt,
 		work.StatusLeased,
 		work.StatusRunning,
 	)
@@ -647,8 +651,10 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 	return ensureAffected(res)
 }
 
-func (s *Store) CompleteJob(ctx context.Context, jobID, worker, resultSummary string) error {
-	return s.finishJob(ctx, jobID, worker, work.StatusSucceeded, "", resultSummary)
+// CompleteJob implements work.Store, fenced on the caller's lease generation
+// (see Heartbeat).
+func (s *Store) CompleteJob(ctx context.Context, jobID, worker string, attempt int, resultSummary string) error {
+	return s.finishJob(ctx, jobID, worker, attempt, work.StatusSucceeded, "", resultSummary)
 }
 
 // FailJob implements work.Store. The retryable path requeues the job and sets
@@ -711,13 +717,13 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 }
 
 func (s *Store) finishJob(
-	ctx context.Context, jobID, worker string, status work.Status, lastError, resultSummary string,
+	ctx context.Context, jobID, worker string, attempt int, status work.Status, lastError, resultSummary string,
 ) error {
 	now := time.Now().UTC()
 	const updateSQL = `
 UPDATE jobs
 SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, result_summary = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ?
+WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 `
 	res, err := s.db.ExecContext(
 		ctx,
@@ -728,6 +734,7 @@ WHERE job_id = ? AND lease_owner = ?
 		now.Format(time.RFC3339Nano),
 		jobID,
 		worker,
+		attempt,
 	)
 	if err != nil {
 		return fmt.Errorf("finish job: %w", err)
