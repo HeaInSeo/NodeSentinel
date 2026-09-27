@@ -109,6 +109,12 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	logger := slog.With("job_id", job.JobID, "image_digest", job.ImageDigest)
 	logger.Info("processing job", "actions", job.RequestedActions)
 
+	// Every step of this attempt runs under a context that a confirmed lease
+	// loss cancels (see heartbeat). After that, the attempt starts no new
+	// external report and no new stage, and does not complete or fail the job.
+	ctx, release := withLeaseFence(ctx)
+	defer release(nil)
+
 	plan, err := planStages(job.RequestedActions)
 	if err != nil {
 		// An unrecognized requested_actions value must not be silently
@@ -148,6 +154,9 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	// ExecutionID and retries the retirement instead of skipping it.
 	if job.ExecutionID == "" {
 		if retireErr := w.retireLegacyExecutions(ctx, logger, job); retireErr != nil {
+			if leaseLost(ctx) {
+				return
+			}
 			logger.Error("could not retire pre-execution-identity Jobs", "err", retireErr)
 			decision := decideRetry(FailureClassTransientInfra, job, "retire legacy execution: "+retireErr.Error())
 			w.noteClassification(logger, vaultclient.StageL3, decision.Class, decision.Reason)
@@ -248,6 +257,10 @@ func (w *Worker) process(ctx context.Context, job *work.Job) {
 	defer cancel()
 
 	result := w.runSmokeRun(smokeCtx, logger, ns, job, jobSpec, adopted, !l5aFollows)
+	if leaseLost(ctx) {
+		logger.Warn("lease lost during L4 — another attempt owns this job; not reporting or finishing it")
+		return
+	}
 	if !result.success {
 		decision := decideRetry(result.class, job, result.reason)
 		w.noteClassification(logger, vaultclient.StageL4, decision.Class, decision.Reason)
@@ -277,7 +290,13 @@ func (w *Worker) finishAfterL4(ctx context.Context, logger *slog.Logger, job *wo
 	// WorkStore job status.
 	var l5aErr, l5bErr error
 	if plan.runL5a {
+		if !w.stillLeased(ctx, logger, job) {
+			return
+		}
 		l5aErr = w.runL5a(ctx, logger, job, isL5ALast)
+		if leaseLost(ctx) {
+			return
+		}
 		if l5aErr != nil {
 			w.incL5aErrors()
 		} else {
@@ -287,7 +306,13 @@ func (w *Worker) finishAfterL4(ctx context.Context, logger *slog.Logger, job *wo
 		logger.Info("L5-a skipped: profile not in requested_actions")
 	}
 	if plan.runL5b {
+		if !w.stillLeased(ctx, logger, job) {
+			return
+		}
 		l5bErr = w.runL5b(ctx, logger, job)
+		if leaseLost(ctx) {
+			return
+		}
 		if l5bErr != nil {
 			w.incL5bErrors()
 		} else {
@@ -314,11 +339,66 @@ func (w *Worker) finishAfterL4(ctx context.Context, logger *slog.Logger, job *wo
 	default:
 		summary += "; L5-b skipped (not requested)"
 	}
+	if leaseLost(ctx) {
+		return
+	}
+	// CompleteJob is fenced on this attempt's lease; the completion counter
+	// only moves once the store accepted it.
 	if err := w.store.CompleteJob(ctx, job.JobID, w.workerName, job.Attempt, summary); err != nil {
 		logger.Error("CompleteJob failed", "err", err)
+		return
 	}
 	w.incJobsCompleted()
 	logger.Info("job completed", "summary", summary)
+}
+
+// errLeaseLost is the cancellation cause of an attempt's context once a fenced
+// Heartbeat proved that another attempt re-leased the job.
+var errLeaseLost = errors.New("lease lost: the job was re-leased by another attempt")
+
+type leaseFenceKey struct{}
+
+// withLeaseFence derives an attempt context that heartbeat cancels with
+// errLeaseLost on a confirmed lease loss.
+func withLeaseFence(ctx context.Context) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	return context.WithValue(ctx, leaseFenceKey{}, cancel), cancel
+}
+
+// leaseLost reports whether ctx was canceled because this attempt lost its lease.
+func leaseLost(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errLeaseLost)
+}
+
+// heartbeat extends job's lease. The store fences it on this attempt's owner
+// and attempt, so work.ErrNotFound is a confirmed lease loss: the attempt
+// context is canceled with errLeaseLost. Any other error is ambiguous (the
+// lease may still be held) and is only logged.
+func (w *Worker) heartbeat(ctx context.Context, logger *slog.Logger, job *work.Job) {
+	err := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration)
+	switch {
+	case err == nil:
+	case errors.Is(err, work.ErrNotFound):
+		logger.Warn("lease lost: another attempt re-leased this job — stopping without further reports",
+			"attempt", job.Attempt)
+		if lose, ok := ctx.Value(leaseFenceKey{}).(context.CancelCauseFunc); ok {
+			lose(errLeaseLost)
+		}
+	default:
+		logger.Warn("Heartbeat failed", "err", err)
+	}
+}
+
+// stillLeased is the fenced lease check at a step boundary and before each
+// external report: it heartbeats and reports whether the attempt still holds
+// the lease. A call already in flight when the lease is lost is not covered
+// (the receiver must stay idempotent for that window).
+func (w *Worker) stillLeased(ctx context.Context, logger *slog.Logger, job *work.Job) bool {
+	if leaseLost(ctx) {
+		return false
+	}
+	w.heartbeat(ctx, logger, job)
+	return !leaseLost(ctx)
 }
 
 // reportTerminalFailure submits a CheckRecord for a validation request that
@@ -520,6 +600,11 @@ func (w *Worker) runSmokeRun(
 	for {
 		select {
 		case <-ctx.Done():
+			if leaseLost(ctx) {
+				// Another attempt re-leased the job and adopts this execution:
+				// leave its Job and identity alone.
+				return outcome{success: false, retryable: true, class: FailureClassTransientInfra, reason: errLeaseLost.Error()}
+			}
 			// Best-effort cleanup. The delete is what makes this execution
 			// non-running, so the identity is released only once the Job is
 			// confirmed gone — otherwise the Job may well still be executing
@@ -532,9 +617,7 @@ func (w *Worker) runSmokeRun(
 			}
 			return classifySmokeRun(ctx, w.kube, ns, name, &batchv1.Job{})
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration); err != nil {
-				logger.Warn("Heartbeat failed", "err", err)
-			}
+			w.heartbeat(ctx, logger, job)
 		case <-pollTick.C:
 			k8sJob, err := w.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) && !confirmed {
@@ -699,8 +782,8 @@ func (w *Worker) retireLegacyExecutions(ctx context.Context, logger *slog.Logger
 		}
 		// Each confirmation can take up to deletionConfirmWait. Extend the
 		// lease so a slow retirement cannot let another worker reclaim the job.
-		if hbErr := w.store.Heartbeat(ctx, job.JobID, w.workerName, job.Attempt, leaseDuration); hbErr != nil {
-			logger.Warn("Heartbeat failed", "err", hbErr)
+		if !w.stillLeased(ctx, logger, job) {
+			return errLeaseLost
 		}
 	}
 	return nil
