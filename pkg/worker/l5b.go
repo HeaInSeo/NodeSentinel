@@ -81,6 +81,10 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		policyResult = "warning"
 	}
 
+	if !w.stillLeased(ctx, logger, job) {
+		logger.Warn("L5-b: not submitting scan record: lease lost", "scan_id", scanID)
+		return errLeaseLost
+	}
 	if !w.claimTerminal(ctx, logger, job.JobID) {
 		return nil
 	}
@@ -116,6 +120,10 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 }
 
 func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.Logger, job *work.Job) error {
+	if !w.stillLeased(ctx, logger, job) {
+		logger.Warn("L5-b: not submitting not-available scan record: lease lost")
+		return errLeaseLost
+	}
 	if !w.claimTerminal(ctx, logger, job.JobID) {
 		return nil
 	}

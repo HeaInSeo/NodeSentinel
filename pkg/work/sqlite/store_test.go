@@ -56,10 +56,10 @@ func TestLeaseAndCompleteJob(t *testing.T) {
 		t.Fatalf("lease owner = %q, want worker-a", leased.LeaseOwner)
 	}
 
-	if err := store.Heartbeat(ctx, leased.JobID, "worker-a", 30*time.Second); err != nil {
+	if err := store.Heartbeat(ctx, leased.JobID, "worker-a", leased.Attempt, 30*time.Second); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
-	if err := store.CompleteJob(ctx, leased.JobID, "worker-a", "smoke ok"); err != nil {
+	if err := store.CompleteJob(ctx, leased.JobID, "worker-a", leased.Attempt, "smoke ok"); err != nil {
 		t.Fatalf("CompleteJob: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestWrongWorkerCannotCompleteJob(t *testing.T) {
 		t.Fatalf("LeaseJob: %v", err)
 	}
 
-	err = store.CompleteJob(ctx, leased.JobID, "worker-b", "should not complete")
+	err = store.CompleteJob(ctx, leased.JobID, "worker-b", leased.Attempt, "should not complete")
 	if err != work.ErrNotFound {
 		t.Fatalf("CompleteJob wrong worker err = %v, want %v", err, work.ErrNotFound)
 	}
@@ -210,7 +210,7 @@ func TestExpiredLeaseCanBeReclaimedAfterHeartbeat(t *testing.T) {
 	// Heartbeat with a negative TTL: transitions the job to 'running' and
 	// simultaneously makes that heartbeat's lease_until stale, simulating a
 	// worker that heartbeated once and then crashed.
-	if err := store.Heartbeat(ctx, firstLease.JobID, "worker-a", -time.Second); err != nil {
+	if err := store.Heartbeat(ctx, firstLease.JobID, "worker-a", firstLease.Attempt, -time.Second); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	stale, err := store.GetJob(ctx, firstLease.JobID)
@@ -330,7 +330,7 @@ func TestListJobsFiltersByStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LeaseJob: %v", err)
 	}
-	if err := store.CompleteJob(ctx, leased.JobID, "worker-a", "done"); err != nil {
+	if err := store.CompleteJob(ctx, leased.JobID, "worker-a", leased.Attempt, "done"); err != nil {
 		t.Fatalf("CompleteJob: %v", err)
 	}
 

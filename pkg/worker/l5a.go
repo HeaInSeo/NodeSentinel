@@ -161,6 +161,9 @@ func (w *Worker) runL5a(ctx context.Context, logger *slog.Logger, job *work.Job,
 
 	exitCode, result, runErr := w.waitL5aJob(l5aCtx, logger, job, created.Name)
 	durationSec := int64(time.Since(startedAt).Seconds())
+	if leaseLost(ctx) {
+		return errLeaseLost
+	}
 	if delErr := w.deleteJob(context.Background(), smokeNamespace, created.Name); delErr != nil && !apierrors.IsNotFound(delErr) {
 		logger.Warn("L5-a: failed to delete K8s Job — TTL will clean up",
 			"job", created.Name, "err", delErr)
@@ -289,6 +292,10 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 	for {
 		select {
 		case <-ctx.Done():
+			if leaseLost(ctx) {
+				// The new lease holder adopts this execution: leave its Job alone.
+				return 0, outcome{class: FailureClassTransientInfra, reason: errLeaseLost.Error()}, errLeaseLost
+			}
 			if err := w.deleteAndConfirmGone(smokeNamespace, jobName); err == nil {
 				w.markExecutionTerminal(context.Background(), logger, job)
 			} else {
@@ -298,9 +305,7 @@ func (w *Worker) waitL5aJob(ctx context.Context, logger *slog.Logger, job *work.
 			result := outcome{class: FailureClassTransientInfra, reason: "L5-a timeout: job did not complete within allotted time"}
 			return 0, result, errors.New(result.reason)
 		case <-heartbeatTick.C:
-			if err := w.store.Heartbeat(ctx, job.JobID, w.workerName, leaseDuration); err != nil {
-				logger.Warn("L5-a heartbeat failed", "err", err)
-			}
+			w.heartbeat(ctx, logger, job)
 		case <-pollTick.C:
 			k8sJob, err := w.kube.BatchV1().Jobs(smokeNamespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
@@ -379,6 +384,12 @@ type checkRecordSubmission struct {
 func (w *Worker) submitCheckRecord(
 	ctx context.Context, logger *slog.Logger, job *work.Job, sub checkRecordSubmission,
 ) error {
+	// Checked before the terminal claim: an attempt that lost its lease must not
+	// take the job's one-time terminal slot from the attempt that now owns it.
+	if !w.stillLeased(ctx, logger, job) {
+		logger.Warn("not submitting check record: lease lost", "check_id", sub.checkID, "stage", sub.stage)
+		return errLeaseLost
+	}
 	if sub.terminal && !w.claimTerminal(ctx, logger, job.JobID) {
 		return nil
 	}

@@ -167,8 +167,17 @@ type Job struct {
 type Store interface {
 	CreateJob(ctx context.Context, req JobRequest) (*Job, error)
 	LeaseJob(ctx context.Context, worker string, ttl time.Duration) (*Job, error)
-	Heartbeat(ctx context.Context, jobID, worker string, ttl time.Duration) error
-	CompleteJob(ctx context.Context, jobID, worker, resultSummary string) error
+	// Heartbeat extends worker's lease on jobID and marks it Running. Like
+	// FailJob it is fenced on the lease generation (owner and attempt): once
+	// the lease expired and LeaseJob handed the job out again — to another
+	// worker, or to the same worker name on a later attempt — a heartbeat for
+	// the earlier attempt returns ErrNotFound and must not revive that lease.
+	Heartbeat(ctx context.Context, jobID, worker string, attempt int, ttl time.Duration) error
+	// CompleteJob marks jobID Succeeded, fenced on the same lease generation as
+	// Heartbeat and FailJob. A report from a superseded attempt (its lease was
+	// reclaimed while it ran) returns ErrNotFound and changes nothing, so it
+	// cannot close out the attempt that replaced it.
+	CompleteJob(ctx context.Context, jobID, worker string, attempt int, resultSummary string) error
 	// FailJob records the failure of attempt, the Job.Attempt value LeaseJob
 	// returned to worker. When retryable, the job returns to Queued and, in the
 	// same write, becomes ineligible for LeaseJob until retryDelay has elapsed

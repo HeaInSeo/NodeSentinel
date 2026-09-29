@@ -22,8 +22,9 @@ import (
 
 type Store struct {
 	db *sql.DB
-	// now is the clock LeaseJob and FailJob use to set and compare
-	// retry_not_before. time.Now outside tests.
+	// now is the clock every lease, heartbeat, finish, execution-identity and
+	// delivery write uses (retry_not_before, lease_until, next_attempt_at,
+	// claims, updated_at). time.Now outside tests.
 	now func() time.Time
 }
 
@@ -622,13 +623,16 @@ WHERE job_id = ?
 	return s.GetJob(ctx, jobID)
 }
 
-func (s *Store) Heartbeat(ctx context.Context, jobID, worker string, ttl time.Duration) error {
-	now := time.Now().UTC()
+// Heartbeat implements work.Store. It is fenced on lease_owner plus attempt,
+// matching FailJob: after an expired lease was reclaimed, the previous
+// attempt's heartbeat — even under the same worker name — matches no row.
+func (s *Store) Heartbeat(ctx context.Context, jobID, worker string, attempt int, ttl time.Duration) error {
+	now := s.now().UTC()
 	leaseUntil := now.Add(ttl).UTC().Format(time.RFC3339Nano)
 	const updateSQL = `
 UPDATE jobs
 SET status = ?, lease_until = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
+WHERE job_id = ? AND lease_owner = ? AND attempt = ? AND status IN (?, ?)
 `
 	res, err := s.db.ExecContext(
 		ctx,
@@ -638,6 +642,7 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 		now.Format(time.RFC3339Nano),
 		jobID,
 		worker,
+		attempt,
 		work.StatusLeased,
 		work.StatusRunning,
 	)
@@ -647,8 +652,10 @@ WHERE job_id = ? AND lease_owner = ? AND status IN (?, ?)
 	return ensureAffected(res)
 }
 
-func (s *Store) CompleteJob(ctx context.Context, jobID, worker, resultSummary string) error {
-	return s.finishJob(ctx, jobID, worker, work.StatusSucceeded, "", resultSummary)
+// CompleteJob implements work.Store, fenced on the caller's lease generation
+// (see Heartbeat).
+func (s *Store) CompleteJob(ctx context.Context, jobID, worker string, attempt int, resultSummary string) error {
+	return s.finishJob(ctx, jobID, worker, attempt, work.StatusSucceeded, "", resultSummary)
 }
 
 // FailJob implements work.Store. The retryable path requeues the job and sets
@@ -711,13 +718,13 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 }
 
 func (s *Store) finishJob(
-	ctx context.Context, jobID, worker string, status work.Status, lastError, resultSummary string,
+	ctx context.Context, jobID, worker string, attempt int, status work.Status, lastError, resultSummary string,
 ) error {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const updateSQL = `
 UPDATE jobs
 SET status = ?, lease_owner = '', lease_until = NULL, last_error = ?, result_summary = ?, updated_at = ?
-WHERE job_id = ? AND lease_owner = ?
+WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 `
 	res, err := s.db.ExecContext(
 		ctx,
@@ -728,6 +735,7 @@ WHERE job_id = ? AND lease_owner = ?
 		now.Format(time.RFC3339Nano),
 		jobID,
 		worker,
+		attempt,
 	)
 	if err != nil {
 		return fmt.Errorf("finish job: %w", err)
@@ -796,7 +804,7 @@ func (s *Store) ListJobs(ctx context.Context, status work.Status) ([]*work.Job, 
 // caller — see pkg/worker/delivery.go). Increments result_delivery_attempts
 // so repeated failures are visible without a separate attempts table.
 func (s *Store) MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string, nextAttemptAt time.Time) error {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'pending', result_delivery_payload = ?,
@@ -816,7 +824,7 @@ WHERE job_id = ?
 // jobID's terminal record. Clears the stored payload — it's no longer
 // needed once delivery is confirmed.
 func (s *Store) MarkResultDeliveryAcknowledged(ctx context.Context, jobID string) error {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'acknowledged', result_delivery_payload = '', result_delivery_last_error = '',
@@ -835,7 +843,7 @@ WHERE job_id = ?
 // MarkResultDeliveryAcknowledged, the payload and lastError are preserved —
 // an operator needs them to diagnose or manually resubmit.
 func (s *Store) MarkResultDeliveryDeadLetter(ctx context.Context, jobID, lastError string) error {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'dead_letter', result_delivery_last_error = ?,
@@ -870,7 +878,7 @@ func (s *Store) ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL 
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	nowStr := now.Format(time.RFC3339Nano)
 	const selectSQL = `
 SELECT job_id FROM jobs
@@ -941,7 +949,7 @@ WHERE job_id = ?
 // disambiguates those two so callers can tell "unknown job" (an error) apart
 // from "already claimed" (a normal, no-error, claimed=false outcome).
 func (s *Store) ClaimTerminal(ctx context.Context, jobID string) (bool, error) {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET terminal_submitted = 1, updated_at = ?
@@ -1022,7 +1030,7 @@ func (s *Store) EnsureExecution(ctx context.Context, jobID, _ string) (string, b
 	if err != nil {
 		return "", false, err
 	}
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const updateSQL = `
 UPDATE jobs
 SET execution_id = ?, execution_terminal = 0, updated_at = ?
@@ -1064,7 +1072,7 @@ func newExecutionID(attempt int) (string, error) {
 // stale worker's report about a replaced execution cannot release the
 // replacement (see work.Store.MarkExecutionTerminal).
 func (s *Store) MarkExecutionTerminal(ctx context.Context, jobID, executionID string) error {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET execution_terminal = 1, updated_at = ?

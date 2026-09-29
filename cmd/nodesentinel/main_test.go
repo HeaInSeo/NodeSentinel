@@ -15,6 +15,27 @@ import (
 	"github.com/HeaInSeo/NodeSentinel/pkg/metrics"
 )
 
+// TestWorkerIdentityUniquePerProcess guards against the constant lease owner
+// ("nodesentinel-worker-0") every Pod generation used to share: two identities
+// minted in the same host must differ, so a replacement process never
+// inherits its predecessor's lease owner.
+func TestWorkerIdentityUniquePerProcess(t *testing.T) {
+	a, err := workerIdentity()
+	if err != nil {
+		t.Fatalf("workerIdentity: %v", err)
+	}
+	b, err := workerIdentity()
+	if err != nil {
+		t.Fatalf("workerIdentity: %v", err)
+	}
+	if a == b {
+		t.Fatalf("workerIdentity returned %q twice; want a per-process unique owner", a)
+	}
+	if a == "nodesentinel-worker-0" {
+		t.Fatal("workerIdentity returned the legacy constant owner")
+	}
+}
+
 func TestGRPCPortDefault(t *testing.T) {
 	t.Setenv("NODESENTINEL_GRPC_PORT", "")
 

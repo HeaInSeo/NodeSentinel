@@ -26,11 +26,11 @@ func (f failingStore) LeaseJob(context.Context, string, time.Duration) (*work.Jo
 	return nil, errors.New("not implemented")
 }
 
-func (f failingStore) Heartbeat(context.Context, string, string, time.Duration) error {
+func (f failingStore) Heartbeat(context.Context, string, string, int, time.Duration) error {
 	return errors.New("not implemented")
 }
 
-func (f failingStore) CompleteJob(context.Context, string, string, string) error {
+func (f failingStore) CompleteJob(context.Context, string, string, int, string) error {
 	return errors.New("not implemented")
 }
 

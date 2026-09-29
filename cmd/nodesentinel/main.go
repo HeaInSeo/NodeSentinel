@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -96,7 +98,13 @@ func main() {
 		if dynErr != nil {
 			slog.Warn("dynamic K8s client unavailable — L5-b trivy scan will submit not-available records", "err", dynErr)
 		}
-		w := worker.New(store, kube, "nodesentinel-worker-0").
+		owner, ownerErr := workerIdentity()
+		if ownerErr != nil {
+			slog.Error("mint worker identity", "err", ownerErr)
+			os.Exit(1)
+		}
+		slog.Info("worker identity", "lease_owner", owner)
+		w := worker.New(store, kube, owner).
 			WithVaultClient(vaultclient.New()).
 			WithDynamicKubeClient(dynKube).
 			WithMetrics(m)
@@ -179,6 +187,26 @@ func newHTTPServer(m *metrics.Metrics, listenAddr string) *http.Server {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+// workerIdentity returns the lease owner name this process records in the
+// WorkStore. It is unique per process, not per Deployment: the host name
+// (the Pod name in-cluster) plus a random suffix, so a replacement Pod — or a
+// restarted container in the same Pod — never shares a lease owner with the
+// process it replaced. A constant name let a superseded process's Heartbeat or
+// CompleteJob pass the store's owner check against a lease it no longer held;
+// the store now also fences on attempt, and a distinct owner makes the two
+// generations distinguishable in the job row as well.
+func workerIdentity() (string, error) {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	var buf [6]byte
+	if _, randErr := rand.Read(buf[:]); randErr != nil {
+		return "", fmt.Errorf("generate worker identity suffix: %w", randErr)
+	}
+	return fmt.Sprintf("nodesentinel-%s-%s", host, hex.EncodeToString(buf[:])), nil
 }
 
 func grpcPort() (int, error) {
