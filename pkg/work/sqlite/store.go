@@ -21,16 +21,13 @@ import (
 )
 
 // timestampLayout is the single text form every timestamp column is written
-// in: UTC with all nine fractional digits, so every value is exactly
-// timestampLen bytes and SQL string comparison and ORDER BY agree with time
-// order. time.RFC3339Nano trims trailing zeros, which made "…:05Z" sort after
+// in: UTC with all nine fractional digits, so every value has the same width
+// and SQL string comparison and ORDER BY agree with time order.
+// time.RFC3339Nano trims trailing zeros, which made "…:05Z" sort after
 // "…:05.5Z" (issue #28). time.Parse with time.RFC3339Nano reads both forms,
 // so scanJob is unchanged; normalizeTimestamps rewrites rows written before
 // this layout existed.
-const (
-	timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
-	timestampLen    = len("2006-01-02T15:04:05.000000000Z")
-)
+const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // formatTS formats t in timestampLayout, converting to UTC first.
 func formatTS(t time.Time) string { return t.UTC().Format(timestampLayout) }
@@ -267,37 +264,35 @@ func (s *Store) migrateDeliveryOwnership(ctx context.Context) error {
 // SQL is built at run time.
 type timestampColumn struct {
 	name      string
-	selectSQL string // rows whose value is set but not timestampLen long
+	selectSQL string // every row whose value is set
 	updateSQL string
 }
 
 var timestampColumns = []timestampColumn{
 	{
 		"created_at",
-		`SELECT job_id, created_at FROM jobs WHERE created_at <> '' AND length(created_at) <> ?`,
+		`SELECT job_id, created_at FROM jobs WHERE created_at <> ''`,
 		`UPDATE jobs SET created_at = ? WHERE job_id = ?`,
 	},
 	{
 		"updated_at",
-		`SELECT job_id, updated_at FROM jobs WHERE updated_at <> '' AND length(updated_at) <> ?`,
+		`SELECT job_id, updated_at FROM jobs WHERE updated_at <> ''`,
 		`UPDATE jobs SET updated_at = ? WHERE job_id = ?`,
 	},
 	{
 		"lease_until",
-		`SELECT job_id, lease_until FROM jobs WHERE lease_until IS NOT NULL AND lease_until <> '' AND length(lease_until) <> ?`,
+		`SELECT job_id, lease_until FROM jobs WHERE lease_until IS NOT NULL AND lease_until <> ''`,
 		`UPDATE jobs SET lease_until = ? WHERE job_id = ?`,
 	},
 	{
 		"next_attempt_at",
-		`SELECT job_id, next_attempt_at FROM jobs
-WHERE next_attempt_at IS NOT NULL AND next_attempt_at <> '' AND length(next_attempt_at) <> ?`,
+		`SELECT job_id, next_attempt_at FROM jobs WHERE next_attempt_at IS NOT NULL AND next_attempt_at <> ''`,
 		`UPDATE jobs SET next_attempt_at = ? WHERE job_id = ?`,
 	},
 	{
 		"result_delivery_claimed_until",
 		`SELECT job_id, result_delivery_claimed_until FROM jobs
-WHERE result_delivery_claimed_until IS NOT NULL AND result_delivery_claimed_until <> ''
-  AND length(result_delivery_claimed_until) <> ?`,
+WHERE result_delivery_claimed_until IS NOT NULL AND result_delivery_claimed_until <> ''`,
 		`UPDATE jobs SET result_delivery_claimed_until = ? WHERE job_id = ?`,
 	},
 }
@@ -306,10 +301,11 @@ WHERE result_delivery_claimed_until IS NOT NULL AND result_delivery_claimed_unti
 // timestampLayout (issue #28): values written by an earlier binary in trimmed
 // time.RFC3339Nano form, or with a non-UTC offset. It runs on every open, not
 // once behind a version marker, so rows an older binary writes after a
-// rollback are fixed again on the next start. Canonical values have exactly
-// timestampLen bytes and are skipped, so a normalized table costs one scan.
-// A value that does not parse fails the open: scanJob could not read that row
-// either, and rewriting it would destroy evidence.
+// rollback are fixed again on the next start. Every populated value is parsed;
+// one is canonical only if re-formatting it reproduces it byte for byte, so a
+// non-canonical value of the same length (e.g. "…:05.1234+00:00") is still
+// rewritten. A value that does not parse fails the open: scanJob could not
+// read that row either, and rewriting it would destroy evidence.
 func (s *Store) normalizeTimestamps(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -350,7 +346,7 @@ func normalizeColumn(ctx context.Context, tx *sql.Tx, col timestampColumn) error
 // nonCanonicalTimestamps returns col's values that are not in timestampLayout,
 // each reformatted into it.
 func nonCanonicalTimestamps(ctx context.Context, tx *sql.Tx, col timestampColumn) ([]timestampFix, error) {
-	rows, err := tx.QueryContext(ctx, col.selectSQL, timestampLen)
+	rows, err := tx.QueryContext(ctx, col.selectSQL)
 	if err != nil {
 		return nil, fmt.Errorf("select %s: %w", col.name, err)
 	}
@@ -366,7 +362,9 @@ func nonCanonicalTimestamps(ctx context.Context, tx *sql.Tx, col timestampColumn
 		if parseErr != nil {
 			return nil, fmt.Errorf("job %s: parse %s %q: %w", jobID, col.name, raw, parseErr)
 		}
-		fixes = append(fixes, timestampFix{jobID: jobID, value: formatTS(ts)})
+		if canonical := formatTS(ts); canonical != raw {
+			fixes = append(fixes, timestampFix{jobID: jobID, value: canonical})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate %s: %w", col.name, err)

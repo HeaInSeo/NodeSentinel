@@ -166,6 +166,75 @@ func TestIssue28_UnparseableLegacyTimestampFailsOpen(t *testing.T) {
 	}
 }
 
+// A non-canonical value with exactly the canonical width must still be
+// rewritten: candidates are chosen by parsing, not by length.
+func TestIssue28_SameWidthNonCanonicalTimestampsNormalizedOnOpen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "ns.sqlite")
+	legacy := openClockedStore(t, path, &testClock{now: halfSecond})
+	if _, err := legacy.CreateJob(ctx, sampleRequest("job-offset")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	// Both are valid RFC3339 and 30 bytes long, like the canonical form.
+	const created, leaseUntil = "2026-09-30T01:00:05.1234+00:00", "2026-09-30T10:00:05.5000+09:00"
+	if len(created) != len("2026-09-30T01:00:05.000000000Z") || len(leaseUntil) != len(created) {
+		t.Fatalf("fixture widths %d/%d; want the canonical width", len(created), len(leaseUntil))
+	}
+	if err := sqlite.ExecRaw(legacy,
+		`UPDATE jobs SET created_at = ?, lease_until = ?, status = 'running', lease_owner = 'old' WHERE job_id = 'job-offset'`,
+		created, leaseUntil); err != nil {
+		t.Fatalf("write row: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store := openClockedStore(t, path, &testClock{now: wholeSecond})
+	for _, c := range []struct{ query, want string }{
+		{`SELECT created_at FROM jobs WHERE job_id = 'job-offset'`, "2026-09-30T01:00:05.123400000Z"},
+		{`SELECT lease_until FROM jobs WHERE job_id = 'job-offset'`, "2026-09-30T01:00:05.500000000Z"},
+	} {
+		got, err := sqlite.QueryString(store, c.query)
+		if err != nil || got != c.want {
+			t.Errorf("%s = %q, %v; want normalized %q", c.query, got, err, c.want)
+		}
+	}
+	// The normalized lease (05.5) is not reclaimed at the whole second before it.
+	assertNoLeasable(t, store, "same-width offset lease before its deadline")
+}
+
+// An unparseable value with exactly the canonical width must fail the open
+// like any other unparseable value, not be skipped by a length check.
+func TestIssue28_SameWidthUnparseableTimestampFailsOpen(t *testing.T) {
+	for _, bad := range []string{
+		"2026-09-30T01:00:05.123456789X", // bad zone designator
+		"2026-13-30T01:00:05.000000000Z", // month 13
+		"not-a-timestamp-but-30-bytes!!",
+	} {
+		t.Run(bad, func(t *testing.T) {
+			if len(bad) != len("2026-09-30T01:00:05.000000000Z") {
+				t.Fatalf("fixture width %d; want the canonical width", len(bad))
+			}
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "ns.sqlite")
+			legacy := openClockedStore(t, path, &testClock{now: halfSecond})
+			if _, err := legacy.CreateJob(ctx, sampleRequest("job-bad")); err != nil {
+				t.Fatalf("CreateJob: %v", err)
+			}
+			if err := sqlite.ExecRaw(legacy, `UPDATE jobs SET lease_until = ? WHERE job_id = 'job-bad'`, bad); err != nil {
+				t.Fatalf("write bad row: %v", err)
+			}
+			if err := legacy.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if s, err := sqlite.New(path); err == nil {
+				_ = s.Close()
+				t.Fatalf("sqlite.New succeeded over lease_until %q; want an error naming the row", bad)
+			}
+		})
+	}
+}
+
 func mustParse(t *testing.T, v string) time.Time {
 	t.Helper()
 	ts, err := time.Parse(time.RFC3339Nano, v)
