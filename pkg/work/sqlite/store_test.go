@@ -614,9 +614,7 @@ func TestResultDelivery_PendingClaimedThenAcknowledged_Lifecycle(t *testing.T) {
 	}
 
 	past := time.Now().UTC().Add(-time.Second) // already due
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
-	}
+	markFirstPending(t, store, job.JobID, `{"kind":"check"}`, "boom", past)
 
 	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
 	if err != nil {
@@ -634,6 +632,9 @@ func TestResultDelivery_PendingClaimedThenAcknowledged_Lifecycle(t *testing.T) {
 	if claimed[0].ResultDeliveryStatus != work.DeliveryDelivering {
 		t.Errorf("ResultDeliveryStatus = %q, want delivering", claimed[0].ResultDeliveryStatus)
 	}
+	if claimed[0].ResultDeliveryClaimToken == "" {
+		t.Fatal("ResultDeliveryClaimToken is empty, want the claim's token")
+	}
 
 	// A second claim call must not re-claim the same job — it's already
 	// Delivering with an unexpired claim.
@@ -645,7 +646,7 @@ func TestResultDelivery_PendingClaimedThenAcknowledged_Lifecycle(t *testing.T) {
 		t.Fatalf("second ClaimPendingDeliveries = %v, want empty (already claimed)", second)
 	}
 
-	if err := store.MarkResultDeliveryAcknowledged(ctx, job.JobID); err != nil {
+	if err := store.MarkResultDeliveryAcknowledged(ctx, job.JobID, claimed[0].ResultDeliveryClaimToken); err != nil {
 		t.Fatalf("MarkResultDeliveryAcknowledged: %v", err)
 	}
 
@@ -681,9 +682,7 @@ func TestClaimPendingDeliveries_NotYetDue_NotClaimed(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	future := time.Now().UTC().Add(time.Hour)
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", future); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
-	}
+	markFirstPending(t, store, job.JobID, `{"kind":"check"}`, "boom", future)
 
 	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
 	if err != nil {
@@ -708,13 +707,12 @@ func TestClaimPendingDeliveries_ExpiredClaim_Reclaimed(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	past := time.Now().UTC().Add(-time.Second)
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
-	}
+	markFirstPending(t, store, job.JobID, `{"kind":"check"}`, "boom", past)
 
 	// Claim with a TTL so short it's already expired by the time we check again.
-	if _, err := store.ClaimPendingDeliveries(ctx, 10, time.Nanosecond); err != nil {
-		t.Fatalf("first ClaimPendingDeliveries: %v", err)
+	first, err := store.ClaimPendingDeliveries(ctx, 10, time.Nanosecond)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first ClaimPendingDeliveries = %d, %v", len(first), err)
 	}
 
 	reclaimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
@@ -723,6 +721,9 @@ func TestClaimPendingDeliveries_ExpiredClaim_Reclaimed(t *testing.T) {
 	}
 	if len(reclaimed) != 1 || reclaimed[0].JobID != job.JobID {
 		t.Fatalf("reclaimed = %v, want exactly [%s]", reclaimed, job.JobID)
+	}
+	if reclaimed[0].ResultDeliveryClaimToken == first[0].ResultDeliveryClaimToken {
+		t.Fatal("reclaim kept the expired claim's token; want a fresh token that fences the old claimer")
 	}
 }
 
@@ -739,14 +740,15 @@ func TestMarkResultDeliveryDeadLetter_PreservesPayloadAndStopsClaiming(t *testin
 		t.Fatalf("CreateJob: %v", err)
 	}
 	past := time.Now().UTC().Add(-time.Second)
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, `{"kind":"check"}`, "boom", past); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
-	}
-	if _, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute); err != nil {
-		t.Fatalf("ClaimPendingDeliveries: %v", err)
+	markFirstPending(t, store, job.JobID, `{"kind":"check"}`, "boom", past)
+	claimedJobs, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute)
+	if err != nil || len(claimedJobs) != 1 {
+		t.Fatalf("ClaimPendingDeliveries = %d, %v", len(claimedJobs), err)
 	}
 
-	if err := store.MarkResultDeliveryDeadLetter(ctx, job.JobID, "payload undecodable"); err != nil {
+	if err := store.MarkResultDeliveryDeadLetter(
+		ctx, job.JobID, claimedJobs[0].ResultDeliveryClaimToken, "payload undecodable",
+	); err != nil {
 		t.Fatalf("MarkResultDeliveryDeadLetter: %v", err)
 	}
 
@@ -787,9 +789,7 @@ func TestClaimPendingDeliveries_RespectsLimitAndOrdering(t *testing.T) {
 			t.Fatalf("CreateJob %s: %v", id, err)
 		}
 		past := time.Now().UTC().Add(-time.Second)
-		if err := store.MarkResultDeliveryPending(ctx, id, `{"kind":"check"}`, "boom", past); err != nil {
-			t.Fatalf("MarkResultDeliveryPending %s: %v", id, err)
-		}
+		markFirstPending(t, store, id, `{"kind":"check"}`, "boom", past)
 		jobIDs = append(jobIDs, id)
 	}
 
@@ -814,7 +814,7 @@ func TestClaimTerminal_FirstCallClaimsSecondCallDoesNot(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 
-	claimed, err := store.ClaimTerminal(ctx, "job-claim-terminal")
+	claimed, err := store.ClaimTerminal(ctx, "job-claim-terminal", "worker-a", 1)
 	if err != nil {
 		t.Fatalf("first ClaimTerminal: %v", err)
 	}
@@ -830,7 +830,7 @@ func TestClaimTerminal_FirstCallClaimsSecondCallDoesNot(t *testing.T) {
 		t.Error("TerminalSubmitted should be true after claiming")
 	}
 
-	claimed, err = store.ClaimTerminal(ctx, "job-claim-terminal")
+	claimed, err = store.ClaimTerminal(ctx, "job-claim-terminal", "worker-b", 2)
 	if err != nil {
 		t.Fatalf("second ClaimTerminal should not error, got: %v", err)
 	}
@@ -843,9 +843,23 @@ func TestClaimTerminal_UnknownJob_ReturnsErrNotFound(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
 
-	_, err := store.ClaimTerminal(ctx, "no-such-job")
+	_, err := store.ClaimTerminal(ctx, "no-such-job", "worker-a", 1)
 	if !errors.Is(err, work.ErrNotFound) {
 		t.Errorf("ClaimTerminal on unknown job: err = %v, want work.ErrNotFound", err)
+	}
+}
+
+// markFirstPending puts jobID's delivery ledger into Pending the way the worker
+// does: claim the terminal slot, then record the failed first delivery as that
+// slot's owner.
+func markFirstPending(t *testing.T, store work.Store, jobID, payload, lastError string, next time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if claimed, err := store.ClaimTerminal(ctx, jobID, "terminal-owner", 1); err != nil || !claimed {
+		t.Fatalf("ClaimTerminal(%s) = %v, %v", jobID, claimed, err)
+	}
+	if err := store.MarkFirstDeliveryPending(ctx, jobID, "terminal-owner", 1, payload, lastError, next); err != nil {
+		t.Fatalf("MarkFirstDeliveryPending(%s): %v", jobID, err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,9 +66,10 @@ func main() {
 	// K8s client for L3/L4 worker (in-cluster preferred, kubeconfig fallback).
 	kube, err := worker.NewKubeClient()
 	if err != nil {
-		slog.Warn("K8s client unavailable — worker will not run", "err", err)
+		slog.Warn("K8s client unavailable — worker will not run, /readyz will report not ready", "err", err)
 		kube = nil
 	}
+	ready := &readiness{store: store, workerEnabled: kube != nil}
 
 	var listenConfig net.ListenConfig
 	lis, err := listenConfig.Listen(ctx, "tcp", listenAddr)
@@ -111,12 +113,16 @@ func main() {
 
 		g.Go(func() error {
 			slog.Info("worker started (L3/L4/L5)")
+			ready.workerRunning.Store(true)
+			defer ready.workerRunning.Store(false)
 			err := w.Run(gCtx)
 			slog.Info("worker stopped", "err", err)
 			return err
 		})
 		g.Go(func() error {
 			slog.Info("delivery retry loop started")
+			ready.deliveryRunning.Store(true)
+			defer ready.deliveryRunning.Store(false)
 			err := w.RunDeliveryLoop(gCtx)
 			slog.Info("delivery retry loop stopped", "err", err)
 			return err
@@ -140,7 +146,7 @@ func main() {
 	// reports. Supervised the same way as the gRPC server: GracefulStop-style
 	// shutdown on gCtx cancellation, and a non-nil Serve error propagates via
 	// g.Wait() like any other loop.
-	httpServer := newHTTPServer(m, httpListenAddr)
+	httpServer := newHTTPServer(m, httpListenAddr, ready.check)
 	g.Go(func() error {
 		<-gCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -161,13 +167,56 @@ func main() {
 	}
 }
 
+// readinessStoreTimeout bounds the store write probe inside one /readyz
+// request. It stays below the manifest's readinessProbe.timeoutSeconds, so a
+// store lock held by a long transaction reports not-ready instead of timing
+// out the probe.
+const readinessStoreTimeout = 1500 * time.Millisecond
+
+// writeProber is the store check readiness needs; *sqlite.Store implements it.
+type writeProber interface {
+	CheckWritable(ctx context.Context) error
+}
+
+// readiness decides /readyz. NodeSentinel is ready only when it can do the
+// work its ingress accepts: the job worker and the result-delivery loop are
+// both running, and the WorkStore can commit a write now. A read (SELECT 1 or
+// a ping) is not enough — a read-only or full volume still answers reads
+// while every job and delivery write fails.
+type readiness struct {
+	store         writeProber
+	workerEnabled bool // false when there is no K8s client, so no worker ever starts
+	workerRunning atomic.Bool
+	// deliveryRunning tracks RunDeliveryLoop, which redelivers terminal
+	// records whose first delivery failed.
+	deliveryRunning atomic.Bool
+}
+
+// check returns nil when ready, or the first reason it is not.
+func (r *readiness) check(ctx context.Context) error {
+	switch {
+	case !r.workerEnabled:
+		return errors.New("worker disabled: no Kubernetes client")
+	case !r.workerRunning.Load():
+		return errors.New("job worker loop is not running")
+	case !r.deliveryRunning.Load():
+		return errors.New("result delivery loop is not running")
+	}
+	ctx, cancel := context.WithTimeout(ctx, readinessStoreTimeout)
+	defer cancel()
+	if err := r.store.CheckWritable(ctx); err != nil {
+		return fmt.Errorf("work store is not writable: %w", err)
+	}
+	return nil
+}
+
 // newHTTPServer builds the /healthz, /readyz, /metrics HTTP server, mirroring
 // the pattern used by JUMI and artifact-handoff (see their pkg/metrics and
-// cmd/*/main.go): /healthz and /readyz both simply report the process is up
-// — NodeSentinel has no external dependency cheap enough to probe per
-// request without its own design work, so a deeper readiness check (e.g.
-// WorkStore connectivity) is left as a follow-up, not this change's scope.
-func newHTTPServer(m *metrics.Metrics, listenAddr string) *http.Server {
+// cmd/*/main.go). /healthz is liveness: it reports only that the process
+// serves HTTP, so a store or dependency outage never restarts the Pod.
+// /readyz returns 503 with the reason while ready reports an error (see
+// readiness.check), and 200 once it passes again.
+func newHTTPServer(m *metrics.Metrics, listenAddr string, ready func(context.Context) error) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -175,7 +224,12 @@ func newHTTPServer(m *metrics.Metrics, listenAddr string) *http.Server {
 			slog.Debug("healthz response write failed", "err", err)
 		}
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := ready(r.Context()); err != nil {
+			slog.Warn("readiness check failed", "err", err)
+			http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte("ready")); err != nil {
 			slog.Debug("readyz response write failed", "err", err)

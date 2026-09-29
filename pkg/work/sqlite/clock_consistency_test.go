@@ -54,8 +54,13 @@ func TestStoreWritesUseInjectedClock(t *testing.T) {
 	}
 
 	clock.Set(t0.Add(3 * time.Minute))
-	if err := store.MarkResultDeliveryPending(ctx, job.JobID, "{}", "boom", t0.Add(4*time.Minute)); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	if claimed, err := store.ClaimTerminal(ctx, job.JobID, "worker-b", next.Attempt); err != nil || !claimed {
+		t.Fatalf("ClaimTerminal = %v, %v", claimed, err)
+	}
+	if err := store.MarkFirstDeliveryPending(
+		ctx, job.JobID, "worker-b", next.Attempt, "{}", "boom", t0.Add(4*time.Minute),
+	); err != nil {
+		t.Fatalf("MarkFirstDeliveryPending: %v", err)
 	}
 	if got := mustGet(t, store, job.JobID); !got.UpdatedAt.Equal(t0.Add(3 * time.Minute)) {
 		t.Fatalf("delivery updated_at = %v, want injected now", got.UpdatedAt)

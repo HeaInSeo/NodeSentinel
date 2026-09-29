@@ -125,10 +125,16 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          # /readyz commits a small WorkStore write and checks the worker and
+          # delivery loops (cmd/nodesentinel readiness). Its store probe gives up
+          # after 1.5s, inside timeoutSeconds.
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+            timeoutSeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz

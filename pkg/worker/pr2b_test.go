@@ -306,22 +306,32 @@ func TestRunL5b_NotAvailable_AlwaysTerminal(t *testing.T) {
 
 // ── Delivery-retry: terminal failures are tracked, non-terminal aren't ─────
 
-// forceDeliveryDueNow rewrites jobID's next_attempt_at to the past,
-// preserving its current payload/lastError, so a test can exercise
-// retryPendingDeliveries immediately after a natural first failure instead
-// of waiting out backoffDuration's real delay.
-func forceDeliveryDueNow(t *testing.T, store work.Store, jobID string) {
+// useImmediateDeliveryRetry moves deliveryClock an hour back for the test, so
+// every next-attempt time a delivery failure computes is already due and a
+// test can claim the delivery at once instead of waiting out
+// backoffDuration's real delay.
+func useImmediateDeliveryRetry(t *testing.T) {
 	t.Helper()
-	job, err := store.GetJob(context.Background(), jobID)
+	orig := deliveryClock
+	deliveryClock = func() time.Time { return time.Now().Add(-time.Hour) }
+	t.Cleanup(func() { deliveryClock = orig })
+}
+
+// claimDelivery claims jobID's due delivery the way RunDeliveryLoop does and
+// returns the claimed row, which carries the claim token redeliverOne needs.
+func claimDelivery(t *testing.T, store work.Store, jobID string) *work.Job {
+	t.Helper()
+	claimed, err := store.ClaimPendingDeliveries(context.Background(), deliveryBatchLimit, deliveryClaimTTL)
 	if err != nil {
-		t.Fatalf("GetJob: %v", err)
+		t.Fatalf("ClaimPendingDeliveries: %v", err)
 	}
-	if err := store.MarkResultDeliveryPending(
-		context.Background(), jobID, job.ResultDeliveryPayload, job.ResultDeliveryLastError,
-		time.Now().Add(-time.Second),
-	); err != nil {
-		t.Fatalf("MarkResultDeliveryPending (force due now): %v", err)
+	for _, job := range claimed {
+		if job.JobID == jobID {
+			return job
+		}
 	}
+	t.Fatalf("delivery for %s not claimable (claimed %d others)", jobID, len(claimed))
+	return nil
 }
 
 // closedVaultClient returns a vaultclient pointed at an address nothing is
@@ -398,6 +408,7 @@ func TestSubmitCheckRecord_NonTerminalDeliveryFailure_DoesNotMarkPending(t *test
 // redeliverOne pipeline end to end.
 
 func TestRedeliverOne_CheckRecord_Acknowledges(t *testing.T) {
+	useImmediateDeliveryRetry(t)
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -417,11 +428,7 @@ func TestRedeliverOne_CheckRecord_Acknowledges(t *testing.T) {
 	var captured []capturedSubmission
 	w.vaultClient = capturingVaultServer(t, &captured)
 
-	pending, err := store.GetJob(context.Background(), job.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	w.redeliverOne(context.Background(), pending)
+	w.redeliverOne(context.Background(), claimDelivery(t, store, job.JobID))
 
 	if len(captured) != 1 {
 		t.Fatalf("redelivery attempts captured = %d, want 1", len(captured))
@@ -439,6 +446,7 @@ func TestRedeliverOne_CheckRecord_Acknowledges(t *testing.T) {
 }
 
 func TestRedeliverOne_StillFailing_IncrementsAttemptsAndStaysPending(t *testing.T) {
+	useImmediateDeliveryRetry(t)
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -456,9 +464,11 @@ func TestRedeliverOne_StillFailing_IncrementsAttemptsAndStaysPending(t *testing.
 
 	// vaultClient still points at the (now permanently closed) server.
 	for i := 0; i < 2; i++ {
-		pending, getErr := store.GetJob(context.Background(), job.JobID)
-		if getErr != nil {
-			t.Fatalf("GetJob: %v", getErr)
+		pending := claimDelivery(t, store, job.JobID)
+		if i == 1 {
+			// The last failure uses the real clock, so its backoff lands in
+			// the future and is checked below.
+			deliveryClock = time.Now
 		}
 		w.redeliverOne(context.Background(), pending)
 	}
@@ -483,6 +493,7 @@ func TestRedeliverOne_StillFailing_IncrementsAttemptsAndStaysPending(t *testing.
 }
 
 func TestRedeliverOne_ScanRecord_Acknowledges(t *testing.T) {
+	useImmediateDeliveryRetry(t)
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -496,11 +507,7 @@ func TestRedeliverOne_ScanRecord_Acknowledges(t *testing.T) {
 
 	var captured []capturedSubmission
 	w.vaultClient = capturingVaultServer(t, &captured)
-	pending, err := store.GetJob(context.Background(), job.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	w.redeliverOne(context.Background(), pending)
+	w.redeliverOne(context.Background(), claimDelivery(t, store, job.JobID))
 
 	if len(captured) != 1 {
 		t.Fatalf("redelivery attempts captured = %d, want 1", len(captured))
@@ -519,9 +526,10 @@ func TestRedeliverOne_ScanRecord_Acknowledges(t *testing.T) {
 
 // TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob covers the full
 // public pipeline: retryPendingDeliveries -> ClaimPendingDeliveries (claims
-// a due job) -> redeliverOne -> acknowledged. Uses forceDeliveryDueNow so
-// the test doesn't have to wait out a real backoff delay.
+// a due job) -> redeliverOne -> acknowledged. Uses useImmediateDeliveryRetry
+// so the test doesn't have to wait out a real backoff delay.
 func TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob(t *testing.T) {
+	useImmediateDeliveryRetry(t)
 	store := newTestStore(t)
 	w := New(store, fake.NewClientset(), "test-worker").WithVaultClient(closedVaultClient(t))
 
@@ -536,7 +544,6 @@ func TestRetryPendingDeliveries_ClaimsAndRedeliversDueJob(t *testing.T) {
 	if err := w.submitCheckRecord(context.Background(), slog.Default(), job, sub); err == nil {
 		t.Fatal("expected initial submission to fail")
 	}
-	forceDeliveryDueNow(t, store, job.JobID)
 
 	var captured []capturedSubmission
 	w.vaultClient = capturingVaultServer(t, &captured)
