@@ -119,11 +119,16 @@ SQLite가 이것을 `unable to open database file`로 표면화한다는 점이�
 
 아래는 이 변경의 지원 범위 **밖**이며, 위 계약을 근거로 주장해서는 안 된다.
 
-- **Fencing이 아니다.** `Recreate`와 RWO는 network partition이나 force-detach에서 writer를
-  격리하지 못한다. split-brain 상황에서 stranded writer가 생길 수 있고, 이 구성은 그것을 막지
-  않는다.
-- **수동 중복 실행.** 누군가 `replicas`를 올리거나 두 번째 Pod를 직접 띄우면 단일 writer 가정이
-  깨진다. manifest contract test는 repo 안의 회귀만 잡고, 클러스터에서의 수동 변경은 잡지 못한다.
+- **Storage-level fencing이 아니다.** `Recreate`와 RWO는 network partition이나 force-detach에서
+  writer를 격리하지 못한다. 다른 노드가 같은 block device에 쓰는 split-brain은 아래 writer lock도
+  막지 못한다.
+- **수동 중복 실행 — 같은 파일을 여는 경우만 차단.** `sqlite.New`는 store를 여는 동안 SQLite
+  EXCLUSIVE lock을 쥔다(FD-07 C2). 같은 volume에서 같은 DB 파일을 여는 두 번째 프로세스
+  (`replicas` 증가, 같은 노드의 두 번째 Pod, 멈춘 채 Terminating에 남은 이전 Pod)는 5초 대기 뒤
+  `ErrWriterLocked`로 시작에 실패하고 worker/delivery loop를 돌리지 않는다. 멈춘(SIGSTOP) 프로세스도
+  lock을 계속 쥐므로 그 사이 다른 writer가 들어오지 못한다. 같은 이유로 NodeSentinel이 도는 동안에는
+  `sqlite3` CLI로도 파일을 열 수 없다 — 조사는 프로세스를 내린 뒤 한다. 다른 경로·다른 volume의
+  두 번째 store는 이 lock의 범위 밖이다.
 - **HA가 아니다.** `replicas: 1`은 의도된 것이다. 노드 장애 시 재스케줄까지 가용성 공백이 있다.
 - **RWO의 다중 노드 의미론.** RWO는 노드 단위 보장이다. 일부 CSI 드라이버에서 같은 노드의 여러
   Pod가 동시에 마운트할 수 있다. 단일 writer는 `replicas: 1`과 `Recreate`가 함께 지켜야 한다.
