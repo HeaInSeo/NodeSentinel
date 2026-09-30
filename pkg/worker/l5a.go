@@ -390,7 +390,7 @@ func (w *Worker) submitCheckRecord(
 		logger.Warn("not submitting check record: lease lost", "check_id", sub.checkID, "stage", sub.stage)
 		return errLeaseLost
 	}
-	if sub.terminal && !w.claimTerminal(ctx, logger, job.JobID) {
+	if sub.terminal && !w.claimTerminal(ctx, logger, job) {
 		return nil
 	}
 

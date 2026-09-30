@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/metrics"
+	"github.com/HeaInSeo/NodeSentinel/pkg/work/sqlite"
 )
 
 // TestWorkerIdentityUniquePerProcess guards against the constant lease owner
@@ -117,7 +120,7 @@ func TestNewHTTPServer_HealthzReadyzMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metrics.New: %v", err)
 	}
-	srv := newHTTPServer(m, ":0")
+	srv := newHTTPServer(m, ":0", alwaysReady)
 
 	for _, tc := range []struct {
 		path       string
@@ -134,6 +137,110 @@ func TestNewHTTPServer_HealthzReadyzMetrics(t *testing.T) {
 				t.Errorf("%s status = %d, want %d", tc.path, rec.Code, tc.wantStatus)
 			}
 		})
+	}
+}
+
+func alwaysReady(context.Context) error { return nil }
+
+func getStatus(t *testing.T, srv *http.Server, path string) (int, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec.Code, rec.Body.String()
+}
+
+// /readyz follows the readiness check both ways: 503 with the reason while it
+// fails, 200 once it passes again. /healthz is liveness and stays 200, so a
+// store outage makes the Pod unready without restarting it.
+func TestNewHTTPServer_ReadyzFollowsReadinessAndHealthzDoesNot(t *testing.T) {
+	m, err := metrics.New()
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	failure := errors.New("work store is not writable: disk full")
+	srv := newHTTPServer(m, ":0", func(context.Context) error { return failure })
+
+	if code, body := getStatus(t, srv, "/readyz"); code != http.StatusServiceUnavailable || !strings.Contains(body, "disk full") {
+		t.Fatalf("/readyz while failing = %d %q, want 503 naming the reason", code, body)
+	}
+	if code, _ := getStatus(t, srv, "/healthz"); code != http.StatusOK {
+		t.Fatalf("/healthz while not ready = %d, want 200 (liveness is process-only)", code)
+	}
+	failure = nil
+	if code, _ := getStatus(t, srv, "/readyz"); code != http.StatusOK {
+		t.Fatalf("/readyz after recovery = %d, want 200", code)
+	}
+}
+
+// fakeProber is a writeProber whose result the test sets.
+type fakeProber struct{ err error }
+
+func (f *fakeProber) CheckWritable(context.Context) error { return f.err }
+
+func TestReadiness_RequiresWorkerLoopsAndWritableStore(t *testing.T) {
+	prober := &fakeProber{}
+	r := &readiness{store: prober, workerEnabled: true}
+	ctx := context.Background()
+
+	if err := r.check(ctx); err == nil || !strings.Contains(err.Error(), "job worker") {
+		t.Fatalf("before the worker loop starts: %v, want not ready (job worker)", err)
+	}
+	r.workerRunning.Store(true)
+	if err := r.check(ctx); err == nil || !strings.Contains(err.Error(), "delivery") {
+		t.Fatalf("worker running, delivery loop not: %v, want not ready (delivery)", err)
+	}
+	r.deliveryRunning.Store(true)
+	if err := r.check(ctx); err != nil {
+		t.Fatalf("all running, store writable: %v, want ready", err)
+	}
+
+	prober.err = errors.New("attempt to write a readonly database")
+	if err := r.check(ctx); err == nil || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("store rejects writes: %v, want not ready (not writable)", err)
+	}
+	prober.err = nil
+	if err := r.check(ctx); err != nil {
+		t.Fatalf("store recovered: %v, want ready", err)
+	}
+
+	r.workerRunning.Store(false) // the loop exited
+	if err := r.check(ctx); err == nil {
+		t.Fatal("worker loop exited: ready, want not ready")
+	}
+
+	disabled := &readiness{store: &fakeProber{}}
+	disabled.workerRunning.Store(true)
+	disabled.deliveryRunning.Store(true)
+	if err := disabled.check(ctx); err == nil || !strings.Contains(err.Error(), "Kubernetes") {
+		t.Fatalf("no K8s client: %v, want not ready (worker disabled)", err)
+	}
+}
+
+// End to end over a real store: /readyz is 200 while the store commits the
+// probe write and 503 once it cannot (here, closed). The read-only case is
+// covered in pkg/work/sqlite's CheckWritable tests.
+func TestReadyz_RealStore_ClosedStoreIsNotReady(t *testing.T) {
+	m, err := metrics.New()
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	store, err := sqlite.New(filepath.Join(t.TempDir(), "ns.sqlite"))
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	r := &readiness{store: store, workerEnabled: true}
+	r.workerRunning.Store(true)
+	r.deliveryRunning.Store(true)
+	srv := newHTTPServer(m, ":0", r.check)
+
+	if code, body := getStatus(t, srv, "/readyz"); code != http.StatusOK {
+		t.Fatalf("/readyz on a healthy store = %d %q, want 200", code, body)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if code, body := getStatus(t, srv, "/readyz"); code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz on a closed store = %d %q, want 503", code, body)
 	}
 }
 
@@ -154,7 +261,7 @@ func TestGracefulShutdown_DrainsHTTPAndGRPCOnCtxCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metrics.New: %v", err)
 	}
-	httpServer := newHTTPServer(m, "127.0.0.1:0")
+	httpServer := newHTTPServer(m, "127.0.0.1:0", alwaysReady)
 	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen http: %v", err)

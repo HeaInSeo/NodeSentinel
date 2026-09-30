@@ -22,6 +22,14 @@ var (
 	// a newer execution has replaced it, and it must not be released by a
 	// report about the older one.
 	ErrExecutionSuperseded = errors.New("workstore: execution identity superseded")
+
+	// ErrDeliveryFenced is returned by a result-delivery write whose caller no
+	// longer owns that delivery: a redelivery outcome under a claim token that
+	// expired and was reclaimed, or was already resolved; or a first-delivery
+	// mark from an attempt that does not hold the terminal slot, or after the
+	// ledger has left NotApplicable. Nothing is changed. The caller logs and
+	// stops; the current owner's outcome stands.
+	ErrDeliveryFenced = errors.New("workstore: delivery write fenced: caller does not own this delivery")
 )
 
 type Status string
@@ -70,13 +78,21 @@ type JobRequest struct {
 // State graph:
 //
 //	NotApplicable -> Pending                (a terminal submission first fails)
+//	NotApplicable -> DeadLetter             (a terminal submission is first rejected
+//	                                          permanently)
 //	Pending       -> Delivering             (ClaimPendingDeliveries claims it)
 //	Delivering    -> Acknowledged           (redelivery succeeds)
 //	Delivering    -> Pending                (redelivery fails with a retryable error)
 //	Delivering    -> DeadLetter             (redelivery fails permanently, or the
 //	                                          stored payload itself is malformed)
-//	Delivering    -> Pending                (claim expires unclaimed — see
-//	                                          ClaimPendingDeliveries' reclaim behavior)
+//	Delivering    -> Delivering             (the claim expired; ClaimPendingDeliveries
+//	                                          reclaims it under a new claim token)
+//
+// Every edge is fenced. The NotApplicable edges apply only for the attempt
+// that holds the job's terminal slot (ClaimTerminal). The Delivering edges
+// apply only under the claim token of the current claim, so a claimer whose
+// claim expired and was taken over cannot move the row back from Acknowledged
+// or DeadLetter, or clear the new claim. Acknowledged and DeadLetter are final.
 type DeliveryStatus string
 
 const (
@@ -133,6 +149,10 @@ type Job struct {
 	// NextAttemptAt gates redelivery eligibility (exponential backoff+jitter
 	// — see pkg/worker/delivery.go). Nil until the first pending mark.
 	NextAttemptAt *time.Time
+	// ResultDeliveryClaimToken identifies the current redelivery claim. It is
+	// set by ClaimPendingDeliveries while ResultDeliveryStatus is Delivering,
+	// and empty otherwise. The claimer passes it back with the outcome.
+	ResultDeliveryClaimToken string
 
 	// TerminalSubmitted records whether this job has already claimed
 	// responsibility for submitting its one terminal validation-result
@@ -191,31 +211,50 @@ type Store interface {
 	GetJob(ctx context.Context, jobID string) (*Job, error)
 	ListJobs(ctx context.Context, status Status) ([]*Job, error)
 
-	// MarkResultDeliveryPending durably records that job's terminal
-	// validation-result record needs (re)delivery, along with the (opaque,
-	// pre-serialized) payload to send, the error that caused the most
-	// recent attempt to fail (empty for the first mark, before any attempt
-	// has actually run), and nextAttemptAt — the earliest time
-	// ClaimPendingDeliveries may claim it again (backoff, computed by the
-	// caller). Increments ResultDeliveryAttempts. Valid from
-	// NotApplicable or Delivering (see DeliveryStatus's state graph).
-	MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string, nextAttemptAt time.Time) error
+	// MarkFirstDeliveryPending durably records that job's terminal
+	// validation-result record failed its first delivery and needs
+	// redelivery: the (opaque, pre-serialized) payload to send, the error of
+	// that first attempt, and nextAttemptAt — the earliest time
+	// ClaimPendingDeliveries may claim it (backoff, computed by the caller).
+	// Increments ResultDeliveryAttempts.
+	//
+	// It applies only for the worker and attempt that won ClaimTerminal for
+	// jobID, and only while the ledger is still NotApplicable. Any other
+	// caller — an attempt that never held the terminal slot, or a repeated
+	// mark after the ledger moved on — gets ErrDeliveryFenced and changes
+	// nothing.
+	MarkFirstDeliveryPending(
+		ctx context.Context, jobID, worker string, attempt int, payload, lastError string, nextAttemptAt time.Time,
+	) error
+	// MarkFirstDeliveryDeadLetter is MarkFirstDeliveryPending for a first
+	// delivery NodeVault rejected permanently: the ledger goes straight to
+	// DeadLetter, keeping payload and lastError for the operator. Same fence.
+	MarkFirstDeliveryDeadLetter(ctx context.Context, jobID, worker string, attempt int, payload, lastError string) error
+	// MarkResultDeliveryPending returns a claimed redelivery to Pending after
+	// a retryable failure, recording lastError and nextAttemptAt. Increments
+	// ResultDeliveryAttempts. It applies only while job is Delivering under
+	// claimToken (the ResultDeliveryClaimToken ClaimPendingDeliveries
+	// returned); otherwise it returns ErrDeliveryFenced and changes nothing.
+	MarkResultDeliveryPending(ctx context.Context, jobID, claimToken, lastError string, nextAttemptAt time.Time) error
 	// MarkResultDeliveryAcknowledged records that NodeVault durably
-	// accepted job's terminal record — clears the stored payload. Valid
-	// from Delivering.
-	MarkResultDeliveryAcknowledged(ctx context.Context, jobID string) error
+	// accepted job's terminal record — clears the stored payload. Same
+	// claim-token fence as MarkResultDeliveryPending.
+	MarkResultDeliveryAcknowledged(ctx context.Context, jobID, claimToken string) error
 	// MarkResultDeliveryDeadLetter records that job's terminal record will
 	// not be redelivered again — see DeliveryDeadLetter. The payload and
-	// lastError are preserved, not cleared. Valid from Delivering.
-	MarkResultDeliveryDeadLetter(ctx context.Context, jobID, lastError string) error
+	// lastError are preserved, not cleared. Same claim-token fence as
+	// MarkResultDeliveryPending.
+	MarkResultDeliveryDeadLetter(ctx context.Context, jobID, claimToken, lastError string) error
 	// ClaimPendingDeliveries atomically selects up to limit jobs eligible
 	// for redelivery (status Pending with NextAttemptAt due, or status
 	// Delivering whose claim has expired — see DeliveryDelivering) and
-	// transitions them to Delivering with a claim expiring after claimTTL,
-	// all within one transaction. Two concurrent callers (overlapping
-	// RunDeliveryLoop iterations, or a future multi-replica NodeSentinel)
-	// therefore never claim the same job — see pkg/work/sqlite's
-	// _txlock=immediate DSN option. Returns oldest-updated first.
+	// transitions them to Delivering with a claim expiring after claimTTL
+	// and a fresh ResultDeliveryClaimToken, all within one transaction. Two
+	// concurrent callers (overlapping RunDeliveryLoop iterations, or a future
+	// multi-replica NodeSentinel) therefore never claim the same job — see
+	// pkg/work/sqlite's _txlock=immediate DSN option. Reclaiming an expired
+	// claim replaces its token, which fences the previous claimer's late
+	// outcome write. Returns oldest-updated first.
 	ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL time.Duration) ([]*Job, error)
 
 	// EnsureExecution returns the execution identity (see Job.ExecutionID)
@@ -272,9 +311,11 @@ type Store interface {
 	// one responsible for actually submitting that job's one terminal
 	// validation-result record; every subsequent caller (a duplicate
 	// invocation, a requeued job re-reaching the same terminal decision
-	// point) gets claimed=false and must not submit again. Returns
-	// ErrNotFound if jobID does not exist.
-	ClaimTerminal(ctx context.Context, jobID string) (claimed bool, err error)
+	// point) gets claimed=false and must not submit again. The winner's
+	// worker and attempt become the slot owner, the only caller the
+	// first-delivery marks accept. Returns ErrNotFound if jobID does not
+	// exist.
+	ClaimTerminal(ctx context.Context, jobID, worker string, attempt int) (claimed bool, err error)
 
 	Close() error
 }

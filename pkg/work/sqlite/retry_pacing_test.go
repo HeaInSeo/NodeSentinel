@@ -323,9 +323,7 @@ func TestFailJob_Retry_PreservesExecutionIdentityAndDeliveryState(t *testing.T) 
 		t.Fatalf("EnsureExecution: id=%q adopted=%v err=%v", execID, adopted, err)
 	}
 	nextDelivery := time.Now().UTC().Add(time.Hour)
-	if err := store.MarkResultDeliveryPending(ctx, "job-a", `{"kind":"check"}`, "nv down", nextDelivery); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
-	}
+	markFirstPending(t, store, "job-a", `{"kind":"check"}`, "nv down", nextDelivery)
 	before := mustGet(t, store, "job-a")
 
 	if err := store.FailJob(ctx, "job-a", "worker-a", 1, "UNKNOWN [unknown-retry]", true, 2*time.Second); err != nil {

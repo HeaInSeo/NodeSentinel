@@ -85,7 +85,7 @@ func (w *Worker) runL5b(ctx context.Context, logger *slog.Logger, job *work.Job)
 		logger.Warn("L5-b: not submitting scan record: lease lost", "scan_id", scanID)
 		return errLeaseLost
 	}
-	if !w.claimTerminal(ctx, logger, job.JobID) {
+	if !w.claimTerminal(ctx, logger, job) {
 		return nil
 	}
 	req := vaultclient.SubmitScanRecordRequest{
@@ -124,7 +124,7 @@ func (w *Worker) submitNotAvailableScanRecord(ctx context.Context, logger *slog.
 		logger.Warn("L5-b: not submitting not-available scan record: lease lost")
 		return errLeaseLost
 	}
-	if !w.claimTerminal(ctx, logger, job.JobID) {
+	if !w.claimTerminal(ctx, logger, job) {
 		return nil
 	}
 	scanID := fmt.Sprintf("l5b-%s", recordIDLabel(job.JobID))

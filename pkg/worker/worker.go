@@ -528,16 +528,21 @@ func (w *Worker) reportTerminalSuccess(ctx context.Context, logger *slog.Logger,
 // since NodeVault's own conflict handling (see vaultclient.SubmitError's 409
 // case) is the backstop for that, whereas a job that never reports any
 // terminal record leaves its ValidationRequestRecord stuck forever.
-func (w *Worker) claimTerminal(ctx context.Context, logger *slog.Logger, jobID string) bool {
-	claimed, err := w.store.ClaimTerminal(ctx, jobID)
+//
+// The slot is claimed for this worker and job.Attempt, the only owner whose
+// first-delivery failure the store then records (see markFirstDeliveryFailure).
+// On the fail-open path no owner was recorded, so a failed delivery there is
+// not queued for redelivery either; the store was already failing.
+func (w *Worker) claimTerminal(ctx context.Context, logger *slog.Logger, job *work.Job) bool {
+	claimed, err := w.store.ClaimTerminal(ctx, job.JobID, w.workerName, job.Attempt)
 	if err != nil {
 		logger.Warn("claim terminal submission slot failed — proceeding without idempotency guard",
-			"job_id", jobID, "err", err)
+			"job_id", job.JobID, "err", err)
 		return true
 	}
 	if !claimed {
 		logger.Info("terminal record already submitted for this job — skipping duplicate submission",
-			"job_id", jobID)
+			"job_id", job.JobID)
 		return false
 	}
 	return true

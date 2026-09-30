@@ -20,6 +20,18 @@ import (
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
 
+// timestampLayout is the single text form every timestamp column is written
+// in: UTC with all nine fractional digits, so every value has the same width
+// and SQL string comparison and ORDER BY agree with time order.
+// time.RFC3339Nano trims trailing zeros, which made "…:05Z" sort after
+// "…:05.5Z" (issue #28). time.Parse with time.RFC3339Nano reads both forms,
+// so scanJob is unchanged; normalizeTimestamps rewrites rows written before
+// this layout existed.
+const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// formatTS formats t in timestampLayout, converting to UTC first.
+func formatTS(t time.Time) string { return t.UTC().Format(timestampLayout) }
+
 type Store struct {
 	db *sql.DB
 	// now is the clock every lease, heartbeat, finish, execution-identity and
@@ -65,6 +77,24 @@ func New(path string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// CheckWritable reports whether the store can durably commit a write right
+// now. It upserts one row in store_meta and commits, so it exercises what job
+// and delivery writes need — the database file, the rollback journal beside
+// it, and free space — rather than only a read. A read-only or full volume, a
+// closed store, or a lock held past ctx's deadline all return an error. It is
+// the readiness probe's store check (see cmd/nodesentinel), cheap enough to
+// run on every probe: one single-row write.
+func (s *Store) CheckWritable(ctx context.Context) error {
+	const q = `
+INSERT INTO store_meta (key, value) VALUES ('readiness_probe', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`
+	if _, err := s.db.ExecContext(ctx, q, formatTS(s.now())); err != nil {
+		return fmt.Errorf("write probe: %w", err)
+	}
+	return nil
 }
 
 // checkDirWritable verifies that the directory holding the database file can
@@ -138,7 +168,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   result_delivery_last_error TEXT NOT NULL DEFAULT '',
   next_attempt_at TEXT,
   result_delivery_claimed_until TEXT,
+  result_delivery_claim_token TEXT NOT NULL DEFAULT '',
   terminal_submitted INTEGER NOT NULL DEFAULT 0,
+  terminal_owner TEXT NOT NULL DEFAULT '',
+  terminal_attempt INTEGER NOT NULL DEFAULT 0,
   execution_id TEXT NOT NULL DEFAULT '',
   execution_terminal INTEGER NOT NULL DEFAULT 0,
   retry_not_before INTEGER,
@@ -153,6 +186,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
+CREATE TABLE IF NOT EXISTS store_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("init schema: %w", err)
@@ -172,7 +209,167 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs(lease_until);
 	if err := s.migrateRetryNotBefore(ctx); err != nil {
 		return fmt.Errorf("migrate retry_not_before: %w", err)
 	}
+	if err := s.migrateDeliveryOwnership(ctx); err != nil {
+		return fmt.Errorf("migrate delivery ownership: %w", err)
+	}
+	if err := s.normalizeTimestamps(ctx); err != nil {
+		return fmt.Errorf("normalize timestamps: %w", err)
+	}
 	return nil
+}
+
+// migrateDeliveryOwnership adds the columns that fence result-delivery
+// writes (see MarkFirstDeliveryPending and ClaimPendingDeliveries), with the
+// same one-transaction check-then-ALTER pattern as migrateResultDelivery.
+//
+// Legacy rows get an empty claim token and an empty terminal owner. An empty
+// token never matches a redelivery write, so a row left 'delivering' by the
+// previous binary is picked up again only through claim expiry, which mints a
+// token. An empty terminal owner never matches a first-delivery write; the
+// attempt that claimed such a row's terminal slot belonged to a process that
+// no longer runs, so no caller legitimately holds it.
+func (s *Store) migrateDeliveryOwnership(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	cols := []struct{ name, ddl string }{
+		{"result_delivery_claim_token", `ALTER TABLE jobs ADD COLUMN result_delivery_claim_token TEXT NOT NULL DEFAULT ''`},
+		{"terminal_owner", `ALTER TABLE jobs ADD COLUMN terminal_owner TEXT NOT NULL DEFAULT ''`},
+		{"terminal_attempt", `ALTER TABLE jobs ADD COLUMN terminal_attempt INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, col := range cols {
+		has, hasErr := hasColumn(ctx, tx, "jobs", col.name)
+		if hasErr != nil {
+			return hasErr
+		}
+		if has {
+			continue
+		}
+		if _, execErr := tx.ExecContext(ctx, col.ddl); execErr != nil {
+			return fmt.Errorf("add %s column: %w", col.name, execErr)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration tx: %w", err)
+	}
+	return nil
+}
+
+// timestampColumn is one jobs column stored as timestampLayout text, with the
+// statements normalizeColumn uses on it. They are spelled out per column so no
+// SQL is built at run time.
+type timestampColumn struct {
+	name      string
+	selectSQL string // every row whose value is set
+	updateSQL string
+}
+
+var timestampColumns = []timestampColumn{
+	{
+		"created_at",
+		`SELECT job_id, created_at FROM jobs WHERE created_at <> ''`,
+		`UPDATE jobs SET created_at = ? WHERE job_id = ?`,
+	},
+	{
+		"updated_at",
+		`SELECT job_id, updated_at FROM jobs WHERE updated_at <> ''`,
+		`UPDATE jobs SET updated_at = ? WHERE job_id = ?`,
+	},
+	{
+		"lease_until",
+		`SELECT job_id, lease_until FROM jobs WHERE lease_until IS NOT NULL AND lease_until <> ''`,
+		`UPDATE jobs SET lease_until = ? WHERE job_id = ?`,
+	},
+	{
+		"next_attempt_at",
+		`SELECT job_id, next_attempt_at FROM jobs WHERE next_attempt_at IS NOT NULL AND next_attempt_at <> ''`,
+		`UPDATE jobs SET next_attempt_at = ? WHERE job_id = ?`,
+	},
+	{
+		"result_delivery_claimed_until",
+		`SELECT job_id, result_delivery_claimed_until FROM jobs
+WHERE result_delivery_claimed_until IS NOT NULL AND result_delivery_claimed_until <> ''`,
+		`UPDATE jobs SET result_delivery_claimed_until = ? WHERE job_id = ?`,
+	},
+}
+
+// normalizeTimestamps rewrites every timestamp value not already in
+// timestampLayout (issue #28): values written by an earlier binary in trimmed
+// time.RFC3339Nano form, or with a non-UTC offset. It runs on every open, not
+// once behind a version marker, so rows an older binary writes after a
+// rollback are fixed again on the next start. Every populated value is parsed;
+// one is canonical only if re-formatting it reproduces it byte for byte, so a
+// non-canonical value of the same length (e.g. "…:05.1234+00:00") is still
+// rewritten. A value that does not parse fails the open: scanJob could not
+// read that row either, and rewriting it would destroy evidence.
+func (s *Store) normalizeTimestamps(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin normalize tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	for _, col := range timestampColumns {
+		if err := normalizeColumn(ctx, tx, col); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit normalize tx: %w", err)
+	}
+	return nil
+}
+
+// timestampFix is one normalized value normalizeColumn writes back.
+type timestampFix struct{ jobID, value string }
+
+// normalizeColumn rewrites the non-canonical values of one timestamp column.
+// All rows are read before any is updated, so the UPDATEs never run while the
+// SELECT's cursor is open.
+func normalizeColumn(ctx context.Context, tx *sql.Tx, col timestampColumn) error {
+	fixes, err := nonCanonicalTimestamps(ctx, tx, col)
+	if err != nil {
+		return err
+	}
+	for _, f := range fixes {
+		if _, err := tx.ExecContext(ctx, col.updateSQL, f.value, f.jobID); err != nil {
+			return fmt.Errorf("rewrite %s for job %s: %w", col.name, f.jobID, err)
+		}
+	}
+	return nil
+}
+
+// nonCanonicalTimestamps returns col's values that are not in timestampLayout,
+// each reformatted into it.
+func nonCanonicalTimestamps(ctx context.Context, tx *sql.Tx, col timestampColumn) ([]timestampFix, error) {
+	rows, err := tx.QueryContext(ctx, col.selectSQL)
+	if err != nil {
+		return nil, fmt.Errorf("select %s: %w", col.name, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var fixes []timestampFix
+	for rows.Next() {
+		var jobID, raw string
+		if scanErr := rows.Scan(&jobID, &raw); scanErr != nil {
+			return nil, fmt.Errorf("scan %s: %w", col.name, scanErr)
+		}
+		ts, parseErr := time.Parse(time.RFC3339Nano, raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("job %s: parse %s %q: %w", jobID, col.name, raw, parseErr)
+		}
+		if canonical := formatTS(ts); canonical != raw {
+			fixes = append(fixes, timestampFix{jobID: jobID, value: canonical})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s: %w", col.name, err)
+	}
+	return fixes, nil
 }
 
 // migrateRetryNotBefore adds the retry_not_before column (see
@@ -513,8 +710,8 @@ ON CONFLICT(validation_request_id) WHERE validation_request_id IS NOT NULL AND v
 		validationRequestID,
 		fingerprint,
 		work.StatusQueued,
-		now.Format(time.RFC3339Nano),
-		now.Format(time.RFC3339Nano),
+		formatTS(now),
+		formatTS(now),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
@@ -589,7 +786,7 @@ LIMIT 1
 		now.UnixNano(),
 		work.StatusLeased,
 		work.StatusRunning,
-		now.Format(time.RFC3339Nano),
+		formatTS(now),
 	).Scan(&jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -609,8 +806,8 @@ WHERE job_id = ?
 		updateSQL,
 		work.StatusLeased,
 		worker,
-		leaseUntil.Format(time.RFC3339Nano),
-		now.Format(time.RFC3339Nano),
+		formatTS(leaseUntil),
+		formatTS(now),
 		jobID,
 	)
 	if err != nil {
@@ -628,7 +825,7 @@ WHERE job_id = ?
 // attempt's heartbeat — even under the same worker name — matches no row.
 func (s *Store) Heartbeat(ctx context.Context, jobID, worker string, attempt int, ttl time.Duration) error {
 	now := s.now().UTC()
-	leaseUntil := now.Add(ttl).UTC().Format(time.RFC3339Nano)
+	leaseUntil := formatTS(now.Add(ttl))
 	const updateSQL = `
 UPDATE jobs
 SET status = ?, lease_until = ?, updated_at = ?
@@ -639,7 +836,7 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ? AND status IN (?, ?)
 		updateSQL,
 		work.StatusRunning,
 		leaseUntil,
-		now.Format(time.RFC3339Nano),
+		formatTS(now),
 		jobID,
 		worker,
 		attempt,
@@ -684,7 +881,7 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ? AND status IN (?, ?)
 			work.StatusQueued,
 			lastError,
 			retryNotBefore,
-			now.Format(time.RFC3339Nano),
+			formatTS(now),
 			jobID,
 			worker,
 			attempt,
@@ -706,7 +903,7 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 		failSQL,
 		work.StatusFailed,
 		lastError,
-		now.Format(time.RFC3339Nano),
+		formatTS(now),
 		jobID,
 		worker,
 		attempt,
@@ -732,7 +929,7 @@ WHERE job_id = ? AND lease_owner = ? AND attempt = ?
 		status,
 		lastError,
 		resultSummary,
-		now.Format(time.RFC3339Nano),
+		formatTS(now),
 		jobID,
 		worker,
 		attempt,
@@ -752,7 +949,8 @@ SELECT job_id, artifact_kind, image_repository, image_digest, stable_ref, tool_n
        version, cas_hash, requested_actions, requested_fixture_set, validation_request_id,
        status, attempt, lease_owner, lease_until, last_error, result_summary, created_at, updated_at,
        result_delivery_status, result_delivery_payload, result_delivery_attempts, result_delivery_last_error,
-       next_attempt_at, terminal_submitted, execution_id, execution_terminal, retry_not_before
+       next_attempt_at, terminal_submitted, execution_id, execution_terminal, retry_not_before,
+       result_delivery_claim_token
 FROM jobs`
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (*work.Job, error) {
@@ -796,65 +994,136 @@ func (s *Store) ListJobs(ctx context.Context, status work.Status) ([]*work.Job, 
 	return out, nil
 }
 
-// MarkResultDeliveryPending records that jobID's terminal validation-result
-// record needs (re)delivery. payload is the pre-serialized request to send
-// (opaque to this package); lastError is the most recent failure (empty for
-// the first mark, before any delivery attempt has run); nextAttemptAt gates
-// when ClaimPendingDeliveries may claim it again (backoff, computed by the
-// caller — see pkg/worker/delivery.go). Increments result_delivery_attempts
-// so repeated failures are visible without a separate attempts table.
-func (s *Store) MarkResultDeliveryPending(ctx context.Context, jobID, payload, lastError string, nextAttemptAt time.Time) error {
+// firstDeliveryFence is the WHERE clause of the two first-delivery writes:
+// the caller must be the (owner, attempt) that claimed the job's terminal
+// slot (see ClaimTerminal), and the ledger must still be untouched.
+const firstDeliveryFence = `
+WHERE job_id = ? AND terminal_submitted = 1 AND terminal_owner = ? AND terminal_attempt = ?
+  AND result_delivery_status = 'not_applicable'
+`
+
+// MarkFirstDeliveryPending implements work.Store.MarkFirstDeliveryPending.
+func (s *Store) MarkFirstDeliveryPending(
+	ctx context.Context, jobID, worker string, attempt int, payload, lastError string, nextAttemptAt time.Time,
+) error {
 	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'pending', result_delivery_payload = ?,
     result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?,
-    next_attempt_at = ?, result_delivery_claimed_until = NULL, updated_at = ?
-WHERE job_id = ?
+    next_attempt_at = ?, result_delivery_claimed_until = NULL, result_delivery_claim_token = '', updated_at = ?
+` + firstDeliveryFence
+	res, err := s.db.ExecContext(ctx, q, payload, lastError, formatTS(nextAttemptAt), formatTS(now),
+		jobID, worker, attempt)
+	if err != nil {
+		return fmt.Errorf("mark first delivery pending: %w", err)
+	}
+	return ensureDeliveryAffected(res)
+}
+
+// MarkFirstDeliveryDeadLetter implements work.Store.MarkFirstDeliveryDeadLetter.
+func (s *Store) MarkFirstDeliveryDeadLetter(
+	ctx context.Context, jobID, worker string, attempt int, payload, lastError string,
+) error {
+	now := s.now().UTC()
+	const q = `
+UPDATE jobs
+SET result_delivery_status = 'dead_letter', result_delivery_payload = ?,
+    result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?,
+    next_attempt_at = NULL, result_delivery_claimed_until = NULL, result_delivery_claim_token = '', updated_at = ?
+` + firstDeliveryFence
+	res, err := s.db.ExecContext(ctx, q, payload, lastError, formatTS(now), jobID, worker, attempt)
+	if err != nil {
+		return fmt.Errorf("mark first delivery dead letter: %w", err)
+	}
+	return ensureDeliveryAffected(res)
+}
+
+// redeliveryFence is the WHERE clause of every redelivery outcome write: the
+// row must still be 'delivering' under the caller's claim token. A claim that
+// expired and was taken over, or already resolved, matches nothing.
+const redeliveryFence = `
+WHERE job_id = ? AND result_delivery_status = 'delivering'
+  AND result_delivery_claim_token <> '' AND result_delivery_claim_token = ?
 `
-	res, err := s.db.ExecContext(ctx, q, payload, lastError,
-		nextAttemptAt.UTC().Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), jobID)
+
+// MarkResultDeliveryPending implements work.Store.MarkResultDeliveryPending.
+// The payload is left as claimed; result_delivery_attempts is incremented so
+// repeated failures are visible without a separate attempts table.
+func (s *Store) MarkResultDeliveryPending(
+	ctx context.Context, jobID, claimToken, lastError string, nextAttemptAt time.Time,
+) error {
+	now := s.now().UTC()
+	const q = `
+UPDATE jobs
+SET result_delivery_status = 'pending',
+    result_delivery_attempts = result_delivery_attempts + 1, result_delivery_last_error = ?,
+    next_attempt_at = ?, result_delivery_claimed_until = NULL, result_delivery_claim_token = '', updated_at = ?
+` + redeliveryFence
+	res, err := s.db.ExecContext(ctx, q, lastError, formatTS(nextAttemptAt), formatTS(now), jobID, claimToken)
 	if err != nil {
 		return fmt.Errorf("mark result delivery pending: %w", err)
 	}
-	return ensureAffected(res)
+	return ensureDeliveryAffected(res)
 }
 
-// MarkResultDeliveryAcknowledged records that NodeVault durably accepted
-// jobID's terminal record. Clears the stored payload — it's no longer
-// needed once delivery is confirmed.
-func (s *Store) MarkResultDeliveryAcknowledged(ctx context.Context, jobID string) error {
+// MarkResultDeliveryAcknowledged implements
+// work.Store.MarkResultDeliveryAcknowledged. Clears the stored payload — it's
+// no longer needed once delivery is confirmed.
+func (s *Store) MarkResultDeliveryAcknowledged(ctx context.Context, jobID, claimToken string) error {
 	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'acknowledged', result_delivery_payload = '', result_delivery_last_error = '',
-    next_attempt_at = NULL, result_delivery_claimed_until = NULL, updated_at = ?
-WHERE job_id = ?
-`
-	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
+    next_attempt_at = NULL, result_delivery_claimed_until = NULL, result_delivery_claim_token = '', updated_at = ?
+` + redeliveryFence
+	res, err := s.db.ExecContext(ctx, q, formatTS(now), jobID, claimToken)
 	if err != nil {
 		return fmt.Errorf("mark result delivery acknowledged: %w", err)
 	}
-	return ensureAffected(res)
+	return ensureDeliveryAffected(res)
 }
 
-// MarkResultDeliveryDeadLetter records that jobID's terminal record will not
-// be redelivered again (see work.DeliveryDeadLetter). Unlike
+// MarkResultDeliveryDeadLetter implements
+// work.Store.MarkResultDeliveryDeadLetter. Unlike
 // MarkResultDeliveryAcknowledged, the payload and lastError are preserved —
 // an operator needs them to diagnose or manually resubmit.
-func (s *Store) MarkResultDeliveryDeadLetter(ctx context.Context, jobID, lastError string) error {
+func (s *Store) MarkResultDeliveryDeadLetter(ctx context.Context, jobID, claimToken, lastError string) error {
 	now := s.now().UTC()
 	const q = `
 UPDATE jobs
 SET result_delivery_status = 'dead_letter', result_delivery_last_error = ?,
-    next_attempt_at = NULL, result_delivery_claimed_until = NULL, updated_at = ?
-WHERE job_id = ?
-`
-	res, err := s.db.ExecContext(ctx, q, lastError, now.Format(time.RFC3339Nano), jobID)
+    next_attempt_at = NULL, result_delivery_claimed_until = NULL, result_delivery_claim_token = '', updated_at = ?
+` + redeliveryFence
+	res, err := s.db.ExecContext(ctx, q, lastError, formatTS(now), jobID, claimToken)
 	if err != nil {
 		return fmt.Errorf("mark result delivery dead letter: %w", err)
 	}
-	return ensureAffected(res)
+	return ensureDeliveryAffected(res)
+}
+
+// ensureDeliveryAffected maps a fenced delivery write that matched no row to
+// work.ErrDeliveryFenced.
+func ensureDeliveryAffected(res sql.Result) error {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 0 {
+		return work.ErrDeliveryFenced
+	}
+	return nil
+}
+
+// newClaimToken mints a delivery claim token. Like newExecutionID it surfaces
+// a crypto/rand failure instead of falling back to a guessable value: two
+// claims sharing a token would reopen the stale-write hazard the token fences.
+func newClaimToken() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("generate delivery claim token: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // ClaimPendingDeliveries atomically selects up to limit jobs eligible for
@@ -879,7 +1148,7 @@ func (s *Store) ClaimPendingDeliveries(ctx context.Context, limit int, claimTTL 
 	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
 
 	now := s.now().UTC()
-	nowStr := now.Format(time.RFC3339Nano)
+	nowStr := formatTS(now)
 	const selectSQL = `
 SELECT job_id FROM jobs
 WHERE (result_delivery_status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
@@ -916,15 +1185,23 @@ LIMIT ?
 		return nil, nil
 	}
 
-	claimedUntil := now.Add(claimTTL).Format(time.RFC3339Nano)
+	claimedUntil := formatTS(now.Add(claimTTL))
 	const updateSQL = `
 UPDATE jobs
-SET result_delivery_status = 'delivering', result_delivery_claimed_until = ?, updated_at = ?
+SET result_delivery_status = 'delivering', result_delivery_claimed_until = ?, result_delivery_claim_token = ?,
+    updated_at = ?
 WHERE job_id = ?
 `
 	out := make([]*work.Job, 0, len(jobIDs))
 	for _, id := range jobIDs {
-		if _, err := tx.ExecContext(ctx, updateSQL, claimedUntil, nowStr, id); err != nil {
+		// A fresh token per claim, including a reclaim of an expired claim: the
+		// previous claimer's token stops matching, so its late outcome write is
+		// rejected instead of overwriting this claim's.
+		token, tokenErr := newClaimToken()
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
+		if _, err := tx.ExecContext(ctx, updateSQL, claimedUntil, token, nowStr, id); err != nil {
 			return nil, fmt.Errorf("claim job %q: %w", id, err)
 		}
 		row := tx.QueryRowContext(ctx, jobSelectQuery+" WHERE job_id = ?", id)
@@ -947,15 +1224,17 @@ WHERE job_id = ?
 // call performed the 0->1 transition (won the claim) and RowsAffected==0
 // means either jobID doesn't exist or it was already claimed; jobExists
 // disambiguates those two so callers can tell "unknown job" (an error) apart
-// from "already claimed" (a normal, no-error, claimed=false outcome).
-func (s *Store) ClaimTerminal(ctx context.Context, jobID string) (bool, error) {
+// from "already claimed" (a normal, no-error, claimed=false outcome). The
+// winner's worker and attempt are recorded as the slot owner, which is what
+// MarkFirstDeliveryPending/MarkFirstDeliveryDeadLetter fence on.
+func (s *Store) ClaimTerminal(ctx context.Context, jobID, worker string, attempt int) (bool, error) {
 	now := s.now().UTC()
 	const q = `
 UPDATE jobs
-SET terminal_submitted = 1, updated_at = ?
+SET terminal_submitted = 1, terminal_owner = ?, terminal_attempt = ?, updated_at = ?
 WHERE job_id = ? AND terminal_submitted = 0
 `
-	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID)
+	res, err := s.db.ExecContext(ctx, q, worker, attempt, formatTS(now), jobID)
 	if err != nil {
 		return false, fmt.Errorf("claim terminal: %w", err)
 	}
@@ -1036,7 +1315,7 @@ UPDATE jobs
 SET execution_id = ?, execution_terminal = 0, updated_at = ?
 WHERE job_id = ?
 `
-	if _, execErr := tx.ExecContext(ctx, updateSQL, newID, now.Format(time.RFC3339Nano), jobID); execErr != nil {
+	if _, execErr := tx.ExecContext(ctx, updateSQL, newID, formatTS(now), jobID); execErr != nil {
 		return "", false, fmt.Errorf("mint execution identity: %w", execErr)
 	}
 	if commitErr := tx.Commit(); commitErr != nil {
@@ -1078,7 +1357,7 @@ UPDATE jobs
 SET execution_terminal = 1, updated_at = ?
 WHERE job_id = ? AND execution_id = ? AND execution_id != ''
 `
-	res, err := s.db.ExecContext(ctx, q, now.Format(time.RFC3339Nano), jobID, executionID)
+	res, err := s.db.ExecContext(ctx, q, formatTS(now), jobID, executionID)
 	if err != nil {
 		return fmt.Errorf("mark execution terminal: %w", err)
 	}
@@ -1169,6 +1448,7 @@ func scanJob(scan scanner) (*work.Job, error) {
 		&job.ExecutionID,
 		&executionTerminal,
 		&retryNotBefore,
+		&job.ResultDeliveryClaimToken,
 	)
 	if err != nil {
 		return nil, err

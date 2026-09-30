@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,21 +67,99 @@ func TestBackoffDuration_FirstAttempt_BaseWithBoundedJitter(t *testing.T) {
 
 // ── redeliverOne dead-letter paths ───────────────────────────────────────────
 
-func markPendingAndFetch(t *testing.T, store work.Store, payload string) *work.Job {
+// markFirstPendingDue records payload as a new job's failed first delivery,
+// as the terminal-slot owner, due at once. It returns the job ID.
+func markFirstPendingDue(t *testing.T, store work.Store, payload string) string {
 	t.Helper()
-	job, err := store.CreateJob(context.Background(), newTestJob())
+	ctx := context.Background()
+	job, err := store.CreateJob(ctx, newTestJob())
 	if err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
+	if claimed, err := store.ClaimTerminal(ctx, job.JobID, "test-worker", job.Attempt); err != nil || !claimed {
+		t.Fatalf("ClaimTerminal = %v, %v", claimed, err)
+	}
 	past := time.Now().Add(-time.Second)
-	if err := store.MarkResultDeliveryPending(context.Background(), job.JobID, payload, "boom", past); err != nil {
-		t.Fatalf("MarkResultDeliveryPending: %v", err)
+	if err := store.MarkFirstDeliveryPending(ctx, job.JobID, "test-worker", job.Attempt, payload, "boom", past); err != nil {
+		t.Fatalf("MarkFirstDeliveryPending: %v", err)
 	}
-	pending, err := store.GetJob(context.Background(), job.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
+	return job.JobID
+}
+
+// markPendingAndFetch is markFirstPendingDue followed by a claim; it returns
+// the row claimed for redelivery.
+func markPendingAndFetch(t *testing.T, store work.Store, payload string) *work.Job {
+	t.Helper()
+	return claimDelivery(t, store, markFirstPendingDue(t, store, payload))
+}
+
+// countingVault returns a vaultclient whose server answers every request with
+// status, and the counter of requests it received.
+func countingVault(t *testing.T, status int) (*vaultclient.Client, *atomic.Int32) {
+	t.Helper()
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+	return vaultclient.NewWithAddr(srv.URL), &n
+}
+
+// TestRedeliverOne_StaleClaimerCannotUndoReclaimedAck is the worker-level
+// form of the C3 interleavings: claimer A stalls past its claim, B reclaims
+// and delivers, then A's own POST finishes with a failure. A's outcome must
+// not change the ledger — neither back to pending (a redelivery of an
+// acknowledged record) nor to a false dead-letter — and nothing is posted
+// again afterwards.
+func TestRedeliverOne_StaleClaimerCannotUndoReclaimedAck(t *testing.T) {
+	const payload = `{"kind":"check","check":{"check_id":"c1","image_digest":"sha256:aaa","validation_status":"succeeded"}}`
+	for _, tc := range []struct {
+		name       string
+		staleReply int
+	}{
+		{"stale retryable failure", http.StatusInternalServerError},
+		{"stale permanent failure", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			jobID := markFirstPendingDue(t, store, payload)
+
+			// A claims with a TTL that has already run out when B looks.
+			staleClaims, err := store.ClaimPendingDeliveries(ctx, deliveryBatchLimit, time.Nanosecond)
+			if err != nil || len(staleClaims) != 1 {
+				t.Fatalf("claim A = %d, %v", len(staleClaims), err)
+			}
+			a := staleClaims[0]
+			b := claimDelivery(t, store, jobID)
+
+			okVault, okPosts := countingVault(t, http.StatusOK)
+			New(store, fake.NewClientset(), "worker-b").WithVaultClient(okVault).redeliverOne(ctx, b)
+
+			failVault, failPosts := countingVault(t, tc.staleReply)
+			New(store, fake.NewClientset(), "worker-a").WithVaultClient(failVault).redeliverOne(ctx, a)
+
+			got, err := store.GetJob(ctx, jobID)
+			if err != nil {
+				t.Fatalf("GetJob: %v", err)
+			}
+			if got.ResultDeliveryStatus != work.DeliveryAcknowledged {
+				t.Fatalf("status = %q, want acknowledged to stand after A's stale outcome", got.ResultDeliveryStatus)
+			}
+			if got.ResultDeliveryAttempts != 1 || got.ResultDeliveryLastError != "" {
+				t.Fatalf("stale outcome leaked: attempts %d, last error %q", got.ResultDeliveryAttempts, got.ResultDeliveryLastError)
+			}
+
+			// Nothing is left to redeliver: no further POST from either vault.
+			New(store, fake.NewClientset(), "worker-c").WithVaultClient(okVault).retryPendingDeliveries(ctx)
+			if posts := okPosts.Load() + failPosts.Load(); posts != 2 {
+				t.Fatalf("POSTs = %d, want 2 (B's delivery and A's in-flight one); an acknowledged record was re-sent", posts)
+			}
+		})
 	}
-	return pending
 }
 
 func TestRedeliverOne_UnmarshalFailure_DeadLetter(t *testing.T) {
