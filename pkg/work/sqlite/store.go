@@ -14,8 +14,8 @@ import (
 	"sort"
 	"time"
 
-	// Register the sqlite3 database driver used by sql.Open.
-	_ "github.com/mattn/go-sqlite3"
+	// Registers the sqlite3 database driver used by sql.Open.
+	"github.com/mattn/go-sqlite3"
 
 	"github.com/HeaInSeo/NodeSentinel/pkg/work"
 )
@@ -51,7 +51,11 @@ func New(path string) (*Store, error) {
 	// migrateValidationRequestID) before either one blocks — immediate
 	// transactions take the write lock up front, serializing exactly that
 	// race instead of leaving it to be resolved mid-transaction.
-	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_foreign_keys=on&_txlock=immediate", path)
+	//
+	// _locking_mode=EXCLUSIVE makes the connection keep its file lock once
+	// taken instead of releasing it after each transaction; acquireWriterLock
+	// takes it before anything else touches the file (see there).
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_foreign_keys=on&_txlock=immediate&_locking_mode=EXCLUSIVE", path)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -66,6 +70,16 @@ func New(path string) (*Store, error) {
 	// contention. Capping the pool at one connection makes database/sql's
 	// own connection queue the single serialization point instead.
 	db.SetMaxOpenConns(1)
+	// The one connection is also the holder of the writer lock, so the pool
+	// must never retire it: closing it would drop the lock mid-lifetime.
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	db.SetConnMaxIdleTime(0)
+
+	if err := acquireWriterLock(context.Background(), db, path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	store := &Store{db: db, now: time.Now}
 	if err := store.initSchema(context.Background()); err != nil {
@@ -73,6 +87,70 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// ErrWriterLocked reports that another open Store — in this process or
+// another one sharing the volume — already holds the database's writer lock.
+var ErrWriterLocked = errors.New("workstore is held by another writer")
+
+// acquireWriterLock makes this Store the only writer of the file for as long
+// as it stays open (J1 durable single-writer profile, FD-07 C2).
+//
+// Per-transaction locking plus the C1 owner+attempt fence still let a second
+// process on the same volume — a stray same-node Pod, a debug copy, or a
+// predecessor stuck in Terminating — open the file and run its own lease and
+// delivery loops next to the first one. In EXCLUSIVE locking mode SQLite keeps
+// the exclusive lock a write transaction takes until the connection closes,
+// and the pool above holds exactly one connection that it never retires, so
+// one empty BEGIN EXCLUSIVE/COMMIT here holds the lock for the Store's
+// lifetime. A second opener waits _busy_timeout for it and then fails New
+// with ErrWriterLocked, before its loops start. Close releases the lock, so a
+// normal restart opens as before.
+//
+// A process that is paused (SIGSTOP) keeps the lock, so no other writer is
+// admitted while it is stranded. A storage-level force-detach, where another
+// node writes the same block device, is outside what a file lock can fence.
+func acquireWriterLock(ctx context.Context, db *sql.DB, path string) (err error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return writerLockError(path, err)
+	}
+	// conn.Close returns the connection — and the lock it now holds — to the
+	// pool; it does not close it.
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("return workstore lock connection to the pool: %w", closeErr)
+		}
+	}()
+
+	// Contend for the lock in NORMAL mode: in EXCLUSIVE mode an opener whose
+	// BEGIN fails keeps the SHARED lock it took on the way, so concurrent
+	// openers would block each other's EXCLUSIVE and all fail. Only the
+	// winner, already holding EXCLUSIVE, switches to EXCLUSIVE mode, which
+	// makes COMMIT keep the lock. The DSN's EXCLUSIVE mode still covers a
+	// connection the pool would ever have to replace.
+	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = NORMAL"); err != nil {
+		return fmt.Errorf("take workstore writer lock on %q: %w", path, err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		return writerLockError(path, err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
+		_, rollbackErr := conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("take workstore writer lock on %q: %w", path, errors.Join(err, rollbackErr))
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("take workstore writer lock on %q: %w", path, err)
+	}
+	return nil
+}
+
+func writerLockError(path string, err error) error {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && (sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked) {
+		return fmt.Errorf("%w: %q (only one NodeSentinel process may open a workstore): %w", ErrWriterLocked, path, err)
+	}
+	return fmt.Errorf("take workstore writer lock on %q: %w", path, err)
 }
 
 func (s *Store) Close() error {

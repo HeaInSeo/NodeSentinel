@@ -71,8 +71,11 @@ func TestLeaseGeneration_RestartReclaimFencesStaleOwner(t *testing.T) {
 		t.Fatalf("EnsureExecution after restart = (%q, adopted=%v, %v), want adopt %q", adoptedID, adopted, err, execID)
 	}
 
-	// The superseded process resumes on its own handle.
-	stale := openAt(t, path)
+	// The superseded generation resumes and reports. The writer lock (C2)
+	// admits no second handle on the file while restarted is open, so its
+	// stale reports reach the one open Store; the attempt fence must reject
+	// them there.
+	stale := restarted
 	if err := stale.Heartbeat(ctx, gen1.JobID, "owner-gen-1", gen1.Attempt, time.Minute); !errors.Is(err, work.ErrNotFound) {
 		t.Fatalf("stale Heartbeat err = %v, want ErrNotFound", err)
 	}
@@ -206,15 +209,17 @@ func TestTerminalJob_NoReplayAfterRestart(t *testing.T) {
 	}
 }
 
-// TestLeaseGeneration_ConcurrentHandlesSingleWinner races LeaseJob from two
-// Store handles on one file (two processes on one volume) for a single job,
-// then races the stale and current generations' CompleteJob. Exactly one
-// lease is granted, and only the current generation's completion applies.
+// TestLeaseGeneration_ConcurrentHandlesSingleWinner races LeaseJob from
+// concurrent callers for a single job, then races the stale and current
+// generations' CompleteJob. Exactly one lease is granted, and only the current
+// generation's completion applies. The writer lock (C2) admits one Store per
+// file, so a and b are two callers sharing it rather than two processes; a
+// second handle is rejected (see writer_lock_test.go).
 func TestLeaseGeneration_ConcurrentHandlesSingleWinner(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "nodesentinel.sqlite")
 	a := openAt(t, path)
-	b := openAt(t, path)
+	b := a
 	if _, err := a.CreateJob(ctx, sampleRequest("job-race")); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}

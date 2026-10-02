@@ -537,7 +537,12 @@ func TestCreateJob_SameValidationRequestIDActionsContainingComma_Rejected(t *tes
 // _txlock=immediate DSN option plus running the check-and-ALTER inside one
 // transaction (see migrateValidationRequestID) closes that race: the second
 // opener's BeginTx blocks until the first's migration transaction commits.
-func TestMigrateValidationRequestID_ConcurrentStoreOpens_BothSucceed(t *testing.T) {
+//
+// The writer lock (C2) now admits only one of the concurrent openers at all:
+// it is taken before initSchema, so the migration never runs twice, exactly
+// one opener succeeds with a migrated schema, and the rest fail with
+// ErrWriterLocked rather than "duplicate column name".
+func TestMigrateValidationRequestID_ConcurrentStoreOpens_OneWinsOthersLocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-migration-concurrent.sqlite")
 	seedPreMigrationJobsTable(t, path, "job-old-1", "job-old-2")
 
@@ -562,10 +567,26 @@ func TestMigrateValidationRequestID_ConcurrentStoreOpens_BothSucceed(t *testing.
 		}
 	}
 
+	var winner *sqlite.Store
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("opener %d: sqlite.New failed: %v", i, err)
+		switch {
+		case err == nil:
+			if winner != nil {
+				t.Errorf("opener %d: a second concurrent sqlite.New succeeded; want ErrWriterLocked", i)
+			}
+			winner = stores[i]
+		case !errors.Is(err, sqlite.ErrWriterLocked):
+			t.Errorf("opener %d: sqlite.New err = %v, want nil or ErrWriterLocked", i, err)
 		}
+	}
+	if winner == nil {
+		t.Fatal("no concurrent opener succeeded")
+	}
+
+	req := sampleRequest("job-after-concurrent-open")
+	req.ValidationRequestID = "vr-after-concurrent-open"
+	if _, err := winner.CreateJob(context.Background(), req); err != nil {
+		t.Fatalf("CreateJob on the winning opener: %v", err)
 	}
 }
 
